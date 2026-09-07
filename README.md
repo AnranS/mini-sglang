@@ -22,6 +22,18 @@ Mini-SGLang is a compact implementation of [SGLang](https://github.com/sgl-proje
   - **Optimized Kernels**: Integrates **FlashAttention** and **FlashInfer** for maximum efficiency.
   - ...
 
+## 📖 Local Learning Guide
+
+Read the **[中文源码学习指南](./docs/learning-guide.zh-CN.md)** as a local website, with chapter navigation, diagrams, syntax highlighting, and a source-code viewer:
+
+```bash
+./start-docs.sh
+```
+
+The script opens **http://127.0.0.1:8765/** in your browser. The documentation reader needs only **Python 3.10+** and works on macOS and Linux, without CUDA, Node.js, or inference dependencies. Its rendering libraries are included for offline reading.
+
+Use `./start-docs.sh --port 8766` to change the port, or `./start-docs.sh --no-open` to skip opening the browser. Press **Ctrl+C** to stop. See the **[web reader instructions](./docs/web/README.md)** for details.
+
 ## 🚀 Quick Start
 
 > **⚠️ Platform Support**: Mini-SGLang currently supports **Linux only** (x86_64 and aarch64). Windows and macOS are not supported due to dependencies on Linux-specific CUDA kernels (`sgl-kernel`, `flashinfer`). We recommend using [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) on Windows or Docker for cross-platform compatibility.
@@ -182,5 +194,6 @@ python3 -m sglang.launch_server --model "Qwen/Qwen3-32B" --tp 4 \
 
 ## 📚 Learn More
 
+- **[中文源码学习指南](./docs/learning-guide.zh-CN.md)**: 从请求生命周期出发，学习调度、KV Cache、模型执行、张量并行、CUDA Graph 与性能实验。
 - **[Detailed Features](./docs/features.md)**: Explore all available features and command-line arguments.
 - **[System Architecture](./docs/structures.md)**: Dive deep into the design and data flow of Mini-SGLang.
