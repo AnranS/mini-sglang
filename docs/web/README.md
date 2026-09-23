@@ -49,6 +49,7 @@ MINISGL_DOCS_PYTHON=/path/to/python3 ./start-docs.sh
 - **源码查看**：点击正文中的本地源码链接，在窗口中查看带行号的源文件或浏览目录。源码窗口同样读取当前磁盘文件。
 - **代码与图表**：代码支持语法高亮和复制；第 4、5 章的项目架构图与执行流程图可点击查看原图。3 张 Mermaid 图表在本地绘制，支持滚动和“放大查看”，同时保留可展开的图表源码。
 - **保留原文**：顶部“Markdown”可下载完整原稿。网页的“阅读说明”保留分析基线和验证范围。
+- **学习地图**：顶部“学习地图”（宽屏显示）打开交互式学习地图，也可直接访问 **http://127.0.0.1:8765/assets/learning-map/index.html**，在线版见 **https://anrans.github.io/mini-sglang/**。阶段进度保存在浏览器本地；点击文件名会在 GitHub 上打开对应源码行。
 
 正常阅读不访问 CDN，渲染库、样式和字体配置均使用本地资源。原文引用的外部论文、官方资料仍需联网打开。
 
@@ -61,6 +62,7 @@ start-docs.sh                      一键启动入口
 scripts/serve_docs.py              Python 标准库 HTTP 服务
 scripts/vendor_docs.py             维护者更新本地渲染库的工具
 docs/learning-guide.zh-CN.md        完整正文，唯一内容源
+docs/learning-map/                 学习地图源码（React + esbuild）
 docs/web/
 ├── index.html                    页面结构
 ├── reader.css                    阅读布局与移动端样式
@@ -68,6 +70,7 @@ docs/web/
 ├── document-model.mjs             章节切分与链接解析
 ├── favicon.svg                   页面图标
 ├── figures/                      架构、执行流程配图及生成提示词
+├── learning-map/                 学习地图构建产物，由 docs/learning-map 生成
 └── vendor/                       固定版本的渲染库及许可证
 ```
 
@@ -105,6 +108,18 @@ node --check docs/web/reader.js
 这两组测试检查服务行为和文档结构，不替代真实浏览器中的视觉与交互验收，也不运行推理功能。
 
 Mermaid 使用根级 `htmlLabels: false` 生成 SVG 文本节点，并继续通过 DOMPurify 的 SVG 规则过滤输出。根级选项在当前版本中优先于已弃用的 `flowchart.htmlLabels`，详见 [Mermaid 官方配置说明](https://mermaid.js.org/config/schema-docs/config-properties-htmllabels.html)。升级图表依赖后，应在浏览器确认三张图的节点文字、箭头、滚动与“放大查看”；仅通过语法解析不足以确认文字实际显示。
+
+### 学习地图
+
+`docs/web/learning-map/` 是提交到仓库的构建产物，阅读时无需构建。源码在 `docs/learning-map/`：其中 `mini-sglang-learning-map.canvas.tsx` 同时是 Cursor Canvas 文件，`canvas-shim.tsx` 在浏览器中实现了它用到的 `cursor/canvas` 接口。地图中的源码行号对应提交 `9a91cfa`。修改源码后需要 Node.js 18+：
+
+```bash
+cd docs/learning-map
+npm install
+npm run typecheck && npm run build   # 重新生成 docs/web/learning-map/
+# 提交构建产物并推送 main 后，发布到 gh-pages 分支（GitHub Pages）
+npm run deploy
+```
 
 ## 常见问题
 

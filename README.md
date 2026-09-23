@@ -34,6 +34,8 @@ The script opens **http://127.0.0.1:8765/** in your browser. The documentation r
 
 Use `./start-docs.sh --port 8766` to change the port, or `./start-docs.sh --no-open` to skip opening the browser. Press **Ctrl+C** to stop. See the **[web reader instructions](./docs/web/README.md)** for details.
 
+The same server also hosts the **interactive learning map** at http://127.0.0.1:8765/assets/learning-map/index.html, with a request-journey diagram, mental models, and a staged roadmap with self-check questions and labs. It is also published online at **https://anrans.github.io/mini-sglang/**.
+
 ## 🚀 Quick Start
 
 > **⚠️ Platform Support**: Mini-SGLang currently supports **Linux only** (x86_64 and aarch64). Windows and macOS are not supported due to dependencies on Linux-specific CUDA kernels (`sgl-kernel`, `flashinfer`). We recommend using [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) on Windows or Docker for cross-platform compatibility.
@@ -195,5 +197,6 @@ python3 -m sglang.launch_server --model "Qwen/Qwen3-32B" --tp 4 \
 ## 📚 Learn More
 
 - **[中文源码学习指南](./docs/learning-guide.zh-CN.md)**: 从请求生命周期出发，学习调度、KV Cache、模型执行、张量并行、CUDA Graph 与性能实验。
+- **[交互式学习地图](https://anrans.github.io/mini-sglang/)**: 请求旅程图、心智模型、分阶段学习路线（含自测题与动手实验），学习进度保存在浏览器本地。
 - **[Detailed Features](./docs/features.md)**: Explore all available features and command-line arguments.
 - **[System Architecture](./docs/structures.md)**: Dive deep into the design and data flow of Mini-SGLang.

@@ -1,0 +1,19 @@
+{
+  "name": "minisgl-learning-map",
+  "private": true,
+  "type": "module",
+  "description": "Web build of the interactive mini-sglang learning map (docs/web/learning-map).",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc -p .",
+    "deploy": "cd ../.. && git push --force origin \"$(git subtree split --prefix=docs/web/learning-map HEAD)\":refs/heads/gh-pages"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "esbuild": "^0.28.2",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "typescript": "^7.0.2"
+  }
+}
