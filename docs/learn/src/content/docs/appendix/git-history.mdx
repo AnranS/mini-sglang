@@ -40,7 +40,7 @@ git worktree add ../minisgl-old 900ed45   # 在旁边检出一份旧版本慢慢
 
 [`da7f4a5`](https://github.com/sgl-project/mini-sglang/commit/da7f4a566de14750ebecb51d00ae5ea54a53f09c) initial commit，2025-09-08，+2,539 行。
 
-起点不是空仓库。这个 commit 已经有了 `layers/`（线性层、embedding、norm、rotary）、Llama 模型、FlashAttention 3 后端、KV cache 的 CUDA kernel（`kvcache.cu`，含 store 和 indexing）、`pynccl` 的占位，以及全局上下文 `Context`。**没有** engine，没有 scheduler，也没有任何服务端代码：它是一堆能单独测试的算子和一个模型定义。
+起点不是空仓库。这个 commit 已经有了 `layers/`（线性层、embedding、norm、rotary）、Llama 模型、FlashAttention 3 后端、把 K/V 写进 KV cache 的 CUDA kernel（`kvcache.cu`，三个 store kernel）、`indexing` 和 `pynccl` 的 Python 占位（`indexing.py` 要加载的 `index.cu` 这时还不存在，第 9 站才加），以及全局上下文 `Context`。**没有** engine，没有 scheduler，也没有任何服务端代码：它是一堆能单独测试的算子和一个模型定义。
 
 阅读问题：
 
@@ -63,7 +63,7 @@ git worktree add ../minisgl-old 900ed45   # 在旁边检出一份旧版本慢慢
 
 [`f583dc0`](https://github.com/sgl-project/mini-sglang/commit/f583dc07ecbdbf61a15205e082795106bda2ff49) feat[2/n]: upstream cuda graph，2025-09-09，+268/−44。
 
-新增 `engine/graph.py` 的 `GraphWorker`，按一组 batch size 抓 decode 的 CUDA graph。FA3 后端的 `prepare_metadata` 用 dummy 请求把 batch 补齐到抓过的大小。`forward_batch` 能选择 replay，之后用 `argmax` 取下一个 token（代码里写着 `TODO` 以后换真正的 sampler），追加到请求上，再非阻塞地拷到两块 pinned 结果缓冲之一，用一个 CUDA event 标记拷完。
+新增 `engine/graph.py` 的 `GraphWorker`，按一组 batch size 抓 decode 的 CUDA graph。FA3 后端的 `prepare_metadata` 里用 dummy 请求把 batch 补齐到抓过的大小，这段代码第 0 站就有，这个 commit 让 `Engine.prepare_batch` 改传 `allow_graph=True`，补齐才真正生效。`forward_batch` 能选择 replay，之后用 `argmax` 取下一个 token（代码里写着 `TODO` 以后换真正的 sampler），追加到请求上，再非阻塞地拷到两块 pinned 结果缓冲之一，用一个 CUDA event 标记拷完。
 
 阅读问题：
 
@@ -118,7 +118,7 @@ git worktree add ../minisgl-old 900ed45   # 在旁边检出一份旧版本慢慢
 
 [`dc209b6`](https://github.com/sgl-project/mini-sglang/commit/dc209b65446bf4fe7855c31161fa2b5edd1778ea) feat[8/n]: upstream flashinfer，2025-09-11，+451/−82。
 
-新增 `attention/fi.py` 和 `attention/utils.py`。FlashInfer 的 `plan`（把 batch 的元数据准备好）不在 `prepare_metadata` 里做，而是在第一层 attention 的 `forward` 里懒调用一次。
+第 5 站留下的空文件 `attention/fi.py` 填进了 329 行，另外新增 `attention/utils.py`。FlashInfer 的 `plan`（把 batch 的元数据准备好）不在 `prepare_metadata` 里做，而是在第一层 attention 的 `forward` 里懒调用一次。
 
 阅读问题：
 
@@ -138,7 +138,7 @@ git worktree add ../minisgl-old 900ed45   # 在旁边检出一份旧版本慢慢
 
 [`80e7cfd`](https://github.com/sgl-project/mini-sglang/commit/80e7cfd74b8aed13e92fa98e125e5c5061cf664e) feat[10/n]: support TP，2025-09-15，+1,202/−46。
 
-1,202 行里有 571 行是 NCCL 的头文件 `nccl227.h`，174 行是 `tests/core/test_comm.py`。真正的新代码是：`pynccl.cu` 通信绑定、`index.cu` 里按词表切分的 embedding kernel、生成 `.clangd` 的 `kernel/__main__.py`，`all_gather` 改成返回结果，线性层把输出直接写进通信缓冲。LM head 的 all-gather 也在这里写好，其中一行后来被发现有 bug（修 bug 练习第 1 题）。
+1,202 行里有 571 行是 NCCL 的头文件 `nccl227.h`，174 行是 `tests/core/test_comm.py`。真正的新代码是：`pynccl.cu` 通信绑定、`index.cu` 里按词表切分的 embedding kernel、一次性编译 pynccl、index、kvcache 三个模块的 `kernel/__main__.py`（生成 `.clangd` 是 2025-12-07 的 `1b7a792` 才加的），`all_gather` 改成返回结果，线性层把输出直接写进通信缓冲。LM head 的 all-gather 也在这里写好，其中一行后来被发现有 bug（修 bug 练习第 1 题）。
 
 阅读问题：
 
@@ -153,7 +153,7 @@ API server 加上 OpenAI v1 接口；新增 485 行的 `benchmark/utils.py`（�
 
 阅读问题：
 
-1. 回到第 3 站的问题 2：旧的检查在什么情况下会放进一个 KV 放不下的请求，或者挡住一个其实放得下的请求？
+1. 回到第 3 站的问题 2：旧的检查把表行数和 token 数混在一起减，在什么情况下会挡住一个其实放得下的请求？（它后面还有按 KV 可用量的检查，所以不会放进 KV 放不下的请求。）
 2. 今天的 `client.py` 怎样算 TTFT 和每个 token 的间隔？（<StageLink id="s10" />）
 
 ### 第 11 站：真正重叠起来
@@ -252,7 +252,7 @@ git show 9a91cfa^:python/minisgl/core.py               # 看 Req 的定义
 <Answer>
 `running_reqs` 是 `Req` 的 `set`，`Req` 是 `@dataclass(eq=False)`，哈希用的是对象 id，也就是内存地址。不同进程里同一个请求的对象地址不同，`list(self.running_reqs)` 的顺序也就可能不同。于是两张卡上 batch 第 `i` 行对应的是不同的请求，行并行层做 all-reduce 时会把不同请求的部分和加到一起，输出全错。
 
-修复改成 `sorted(self.running_reqs, key=lambda req: req.uid)`。uid 是分词进程分配的，所有 rank 看到的都一样。prefill 没有这个问题，因为等待队列是按到达顺序的列表。
+修复改成 `sorted(self.running_reqs, key=lambda req: req.uid)`。uid 由 API server 的 `FrontendManager.new_user()` 分配（<StageLink id="s8" />），分词进程只是往下传，所以所有 rank 看到的都一样。prefill 没有这个问题，因为等待队列是按到达顺序的列表。
 </Answer>
 
 ### 练习 3：每张卡各自采样
@@ -263,7 +263,7 @@ git show 9a91cfa^:python/minisgl/core.py               # 看 Req 的定义
 git show 690f55a^:python/minisgl/engine/engine.py   # 看 Engine.__init__ 和 forward_batch
 ```
 
-现象（上游 issue #84）：TP=2、temperature 大于 0 时，rank 0 已经结束的请求，rank 1 还在接着跑，显存迟迟不释放。PR 在 GitHub 上的标题因此是「Fix GPU memory leak caused by output inconsistency」。
+现象（上游 issue #84）：TP=2、temperature 大于 0 时，rank 0 已经结束的请求，rank 1 还在接着跑，显存迟迟不释放。PR 在 GitHub 上的标题因此是「Fix GPU memory leak caused by output inconsistency」；squash 进仓库的 commit 标题换成了原因：「Fix sampler inconsistency due to uninitialized random seed」。
 
 提示：LM head 的 all-gather 之后，每张卡手里的 logits 一样吗？谁在采样？采样的随机数从哪里来？
 
@@ -336,7 +336,7 @@ git show 20fcd7f^:python/minisgl/scheduler/scheduler.py    # 搜 OVERLAP_EXTRA_S
 提示：回到第 7 站的问题。`plan(..., non_blocking=True)` 把 CPU 上的元数据放到哪里、怎样送到 GPU？overlap 下 CPU 比 GPU 领先一批，第二次 `plan` 发生时，第一次的拷贝一定已经执行了吗？
 
 <Answer>
-FlashInfer 的 `plan` 先把 CPU 上的元数据写进它内部一块复用的 pinned 缓冲，再发一个异步的 H2D 拷贝。这个拷贝排在流上，要等前面的 GPU 工作做完才执行。overlap 调度下 CPU 发射完第 N 批就去准备第 N+1 批，第 N+1 次 `plan` 改写 pinned 缓冲时，第 N 次的拷贝可能还没执行，于是第 N 批读到的是第 N+1 批的元数据，页索引越界，就是 illegal memory access。
+FlashInfer 的 `plan` 先把 CPU 上算好的调度表写进它内部一块复用的 pinned 缓冲，再发一个异步的 H2D 拷贝。这个拷贝排在流上，要等前面的 GPU 工作做完才执行。overlap 调度下 CPU 发射完第 N 批就去准备第 N+1 批，第 N+1 次 `plan` 改写 pinned 缓冲时，第 N 次的拷贝可能还没执行，于是第 N 批拿着第 N+1 批的调度表去算，轻则结果不对，重则越界访问（<StageLink id="s7" /> 讲过同一件事）。PR 描述里说，这「可能」就是 illegal memory access 的原因。
 
 修复给后端加了一个 CUDA event：每次 `plan` 之后 `record()`，下一次 `plan` 之前 `synchronize()`，只等上一次 `plan` 发出的拷贝完成，不必等整批 forward 结束。`_initialize_metadata_once` 因此从 `staticmethod` 改成普通方法。有了它，`OVERLAP_EXTRA_SYNC` 这个绕过办法就删掉了。按 PR 描述，它可能同时解决了 issue #58、#67、#89 和 #102。
 </Answer>

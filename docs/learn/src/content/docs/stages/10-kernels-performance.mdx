@@ -58,7 +58,7 @@ mini-sglang 用到的 GPU kernel 来自三个地方：
 
 它们有一个共同点：**第一次用到时才编译**。自己写的 CUDA kernel 由 tvm-ffi 调 `nvcc` 编译，Triton kernel 由 Triton 编译，FlashInfer 的很多 kernel 也是现场 JIT 编译。所以运行 mini-sglang 的机器上除了显卡驱动，还需要完整的 CUDA 工具链（`nvcc` 和 C++ 编译器）。
 
-`kernel/__init__.py` 把这些入口集中导出。调用方都在函数体里 `from minisgl.kernel import ...`，而不是在文件开头导入，这样只有真正用到时才触发编译：Qwen3-0.6B 这种稠密模型永远不会去编译 MoE 的 kernel。
+`kernel/__init__.py` 把这些入口集中导出，导入它会把所有子模块一起导入，包括 MoE 的 `moe_impl`。但导入本身什么也不编译：tvm-ffi 的模块要等带 `functools.cache` 的加载函数（`_jit_store_module`、`_load_radix_module` 这些）第一次被调用时才编译，Triton kernel 要等第一次发射时才编译，`moe_impl` 连 `import triton` 都写在函数体里。所以 Qwen3-0.6B 这种稠密模型永远不会编译 MoE 的 kernel：它从来不调用那几个函数。
 
 ### `load_jit`：把模板实例化成一个模块
 
@@ -171,7 +171,7 @@ Triton 的 kernel 同样在第一次调用时编译，按 `tl.constexpr` 参数�
 
 每个 batch size 录制之前，先用同样的输入**不录制地**跑一遍 `model.forward()`。第一次进这个循环时，这就是进程里的第一次前向：各层第一次调到 RoPE、`silu_and_mul` 等，JIT 编译就发生在这里。编译、分配 workspace 这类事情不能出现在 `torch.cuda.graph` 的录制过程中，先跑一遍正好把它们挪到了录制之前。而 prefill 的 attention 不在 CUDA graph 里（graph 只录 decode），所以它的 kernel 要等到第一个真正的 prefill 才编译。
 
-同一遍前向里，mini-sglang 自己的 `store_cache` 和 `indexing` 也是第一次被调用，会触发 tvm-ffi 的编译。实测记录没有把这部分的耗时单独拆出来；想知道的话，可以让 `TVM_FFI_CACHE_DIR` 指向一个空目录再跑，见下面的动手实验。
+同一遍前向里，mini-sglang 自己的 `store_cache` 和 `indexing` 也是第一次被调用。`~/.cache/tvm-ffi` 里没有缓存时，这里会触发 tvm-ffi 的编译。实测那次冷启动时，这些模块早已缓存在 `~/.cache/tvm-ffi` 里，所以实测时间里不包括这一部分。想知道它要多久，可以让 `TVM_FFI_CACHE_DIR` 指向一个空目录再跑，见下面的动手实验。
 
 <Aside type="tip" title="部署时的含义">
 服务刚启动时第一个请求慢，是正常的。可以在启动后先发一个请求预热，并把 `~/.cache/flashinfer`、`~/.cache/tvm-ffi` 这些缓存目录保留下来。`benchmark/offline/bench.py` 在计时之前先 `generate` 一次，注释写的就是 `to warm up flashinfer`。
@@ -246,7 +246,7 @@ overlap 把第 1、4 步藏到 GPU 计算的背后，CUDA graph 把第 2 步压�
 2. 缓存目录 `minisgl__store_2048_128_1_false_<哈希>` 里的 2048、128、1、false 分别是什么？如果换成 Llama-3-8B（8 个 KV head，`head_dim` 128，bfloat16），`store` 模块要不要重新编译？
 
    <Answer>
-   依次是 `element_size`（一个 token 一层的 K 或 V 的字节数）、每个 block 的线程数、每个 SM 最多驻留几个 block、是否启用 PDL。Llama-3-8B 的 `element_size` 是 8 × 128 × 2 = 2,048，和 Qwen3-0.6B 一样，所以直接复用同一个模块。`indexing` 就不一样了：它的一行是 hidden size × 2 字节，Llama-3-8B 的 hidden size 是 4,096，一行 8,192 字节，会编译一个新的 `minisgl__index_8192_4_...` 模块。
+   依次是 `element_size`（一个 token 一层的 K 或 V 的字节数）、每个 block 的线程数、传给 `__launch_bounds__` 第二个参数的占用度、是否启用 PDL。源码注释说占用度是「max blocks per SM」，按 CUDA 的定义，这个参数其实是希望每个 SM **至少**能同时驻留几个 block，编译器据此限制每个线程的寄存器用量。Llama-3-8B 的 `element_size` 是 8 × 128 × 2 = 2,048，和 Qwen3-0.6B 一样，所以直接复用同一个模块。`indexing` 就不一样了：它的一行是 hidden size × 2 字节，Llama-3-8B 的 hidden size 是 4,096，一行 8,192 字节，会编译一个新的 `minisgl__index_8192_4_...` 模块。
    </Answer>
 
 3. `warp::copy` 搬一行 2,048 字节时，每个线程每次搬多少字节？循环几次？

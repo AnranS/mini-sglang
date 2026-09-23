@@ -31,7 +31,7 @@ import StageLink from '~/components/StageLink.astro';
 
 ## 启动时间和第一个请求
 
-默认配置，prompt 是一条 20 个 token 的对话，生成 73 个 token。「冷启动」指这台机器上第一次运行，FlashInfer 需要现场编译 kernel；「热启动」指编译结果已经缓存在 `~/.cache/flashinfer` 之后。
+默认配置，prompt 是一条 20 个 token 的对话，生成 73 个 token。「冷启动」指 `~/.cache/flashinfer` 里还没有这个 FlashInfer 版本的编译结果、需要现场编译 kernel 的那次运行；mini-sglang 自己的 tvm-ffi 模块当时已经缓存在 `~/.cache/tvm-ffi` 里，不在这个时间里。「热启动」指 FlashInfer 的编译结果也已经缓存之后。
 
 | | 冷启动 | 热启动 |
 | --- | --- | --- |

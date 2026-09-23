@@ -140,7 +140,7 @@ all-gather 沿第 0 维拼接，得到的是 `[tp × bs, V/tp]`：先是 rank 0 
 
 各层并不直接调用哪一种实现，而是通过 <Src path="distributed/impl.py" sym="DistributedCommunicator" />：它总是用 `plugins` 列表里的**最后一个**。初始值是 `TorchDistributedImpl`；<Src path="distributed/impl.py" sym="enable_pynccl_distributed" /> 在多卡时往列表末尾追加一个 `PyNCCLDistributedImpl`，之后所有层的通信就都换成了 PyNCCL。
 
-PyNCCL 由 <Src path="kernel/pynccl.py" sym="init_pynccl" /> 创建：rank 0 调 `ncclGetUniqueId` 生成一个 id，用 gloo 的 `broadcast_object_list` 发给其他 rank，每个 rank 再用这个 id 调 `ncclCommInitRank` 加入同一个 NCCL 通信组。C++ 那一侧编译成一个预编译模块（kernel 的编译和加载见 <StageLink id="s10" />）：
+PyNCCL 由 <Src path="kernel/pynccl.py" sym="init_pynccl" /> 创建：rank 0 调 `ncclGetUniqueId` 生成一个 id，用 gloo 的 `broadcast_object_list` 发给其他 rank，每个 rank 再用这个 id 调 `ncclCommInitRank` 加入同一个 NCCL 通信组。C++ 那一侧由 `load_aot` 加载，第一次调用 `init_pynccl` 时编译（有缓存就直接加载），链接时多一个 `-lnccl`（kernel 的编译和加载见 <StageLink id="s10" />）：
 
 <SrcCode path="kernel/csrc/src/pynccl.cu" sym="all_reduce" mark="if (size_bytes <= m_max_bytes) { // use internal buffer" />
 
@@ -187,7 +187,7 @@ PyNCCL 由 <Src path="kernel/pynccl.py" sym="init_pynccl" /> 创建：rank 0 调
 
 `running_reqs` 是一个 `set`，而 `Req` 用 `@dataclass(eq=False)` 定义，哈希值来自对象的内存地址。不同进程里同一个请求的地址不同，`set` 的遍历顺序也就不同。如果直接 `list(self.running_reqs)`，rank 0 的第 i 行可能是请求 A、rank 1 的第 i 行是请求 B，形状完全一样，不会报错，但 all-reduce 把 A 和 B 的部分和加在了一起，输出是乱的。按 `uid` 排序就是为了消除这个差异。这个排序是上游 main 最新的一个提交 `9a91cfa`（PR [#113](https://github.com/sgl-project/mini-sglang/pull/113)）才加上的。
 
-**4. 采样出同样的 token。** LM head 的 all-gather 让每张卡拿到同样的完整 logits，每张卡**各自采样**。贪心解码时 `argmax` 结果一定相同。随机采样时，每张卡在 `Engine.__init__` 里都执行了 `torch.manual_seed(42)`，而且按同样的顺序做同样的操作，所以推测随机数序列也相同；这一点依赖 FlashInfer 的采样 kernel 从 PyTorch 的默认生成器取种子，本书没有验证。一旦某一步两张卡采出的 token 不同，它们对「谁遇到了 EOS」的判断就会不同，之后的 batch 大小不同，集合通信就对不上了。
+**4. 采样出同样的 token。** LM head 的 all-gather 让每张卡拿到同样的完整 logits，每张卡**各自采样**。贪心解码时 `argmax` 结果一定相同。随机采样时，每张卡在 `Engine.__init__` 里都执行了 `torch.manual_seed(42)`，而且按同样的顺序做同样的操作，所以随机数序列也相同。这一点依赖 FlashInfer 的采样从 PyTorch 的默认生成器取种子：FlashInfer 0.7.0 的 `get_seed_and_offset` 在没传 generator 时，用的就是当前设备的默认生成器。两张卡采出的 token 是否真的逐个相同，本书没有在多卡上实测。一旦某一步两张卡采出的 token 不同，它们对「谁遇到了 EOS」的判断就会不同，之后的 batch 大小不同，集合通信就对不上了。
 
 最后是结果的出口：每个 rank 都会生成 `DetokenizeMsg`，但只有 rank 0 真的发出去（<Src path="scheduler/io.py" sym="SchedulerIOMixin._reply_tokenizer_rank1" />）。
 
