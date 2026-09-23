@@ -1,0 +1,363 @@
+---
+title: Radix cache
+description: 前缀树怎么复用 KV：匹配、加锁、插入、分裂、驱逐，以及哪些槽位必须还回去。
+sidebar:
+  order: 6
+  label: 6 · Radix cache
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import Answer from '~/components/Answer.astro';
+import FileTable from '~/components/FileTable.astro';
+import Mermaid from '~/components/Mermaid.astro';
+import Src from '~/components/Src.astro';
+import SrcCode from '~/components/SrcCode.astro';
+import StageHeader from '~/components/StageHeader.astro';
+import StageLink from '~/components/StageLink.astro';
+
+<StageHeader id="s6" />
+
+## 这一阶段要搞懂什么
+
+<StageLink id="s4" /> 讲了 KV 池怎么分槽位，<StageLink id="s5" /> 讲了调度器什么时候接纳请求、什么时候回收资源。这一章补上两者之间的那一层：请求结束后，它算过的 KV 不一定马上还回空闲列表，而是按 token 序列挂进一棵前缀树（radix tree）。下一个请求如果以同样的 token 开头，就直接复用这些槽位，只算剩下的部分。读完这一章，你应该能不看代码回答：
+
+- 匹配前缀时为什么故意少匹配最后一个输入 token？为什么「只读」的匹配会改动树？
+- 引用计数加在哪些节点上？`evictable` 和 `protected` 这两本账什么时候变？
+- `cache_req` 里那几个长度各是什么，哪一段槽位要还回去、哪一段交给树？
+- 显存不够时驱逐谁？为什么可能驱逐得比要求的多？
+- 同一个 prompt 连续生成 3 次，`evictable` 为什么是 20、30、30？
+
+## 精读清单
+
+<FileTable files={[
+  { path: 'kvcache/base.py', sym: 'BasePrefixCache', note: '接口的几个操作，哪几个会改树' },
+  { path: 'scheduler/cache.py', sym: 'CacheManager.match_req', note: '为什么切掉最后一个 token' },
+  { path: 'kvcache/radix_cache.py', sym: 'RadixPrefixCache._tree_walk', note: '只匹配到节点中间时会发生什么' },
+  { path: 'kvcache/radix_cache.py', sym: 'RadixTreeNode.split_at', note: '分裂出的新节点的 `ref_count` 从哪来' },
+  { path: 'kvcache/radix_cache.py', sym: 'RadixPrefixCache.lock_handle', note: '引用计数加在哪些节点上' },
+  { path: 'kvcache/radix_cache.py', sym: 'RadixPrefixCache.insert_prefix', note: '返回的两个长度分别是什么' },
+  { path: 'scheduler/cache.py', sym: 'CacheManager.cache_req', note: '开头注释里的区间，逐个对到代码' },
+  { path: 'kvcache/radix_cache.py', sym: 'RadixPrefixCache.evict', note: '为什么只摘叶子' },
+  { path: 'kvcache/naive_cache.py', sym: 'NaivePrefixCache', note: '对照：什么都不缓存时这些接口怎么实现' },
+]} />
+
+## 讲解
+
+### 接口：一个句柄，两本账
+
+<SrcCode path="kvcache/base.py" from="@dataclass(frozen=True)" to="# TODO: support HiCache" />
+
+前缀缓存对外只暴露几样东西：
+
+- **句柄** `BaseCacheHandle`：一次匹配或插入的结果，记着命中了多长（`cached_len`），`get_matched_indices()` 返回这段前缀在 KV 池里的槽位下标。radix 的句柄还带着树里的一个节点。
+- **两本账** `SizeInfo`：`evictable_size` 是树里没被任何请求锁住、随时可以驱逐的 token 数；`protected_size` 是被锁住的 token 数。两者之和就是树里一共存着多少 token。
+- **五个操作**，分别由调度器的不同位置调用：
+
+| 操作 | 谁调用 | 改不改树 |
+| --- | --- | --- |
+| `match_prefix` | 准入时的 `CacheManager.match_req` | 可能分裂节点，但不改两本账 |
+| `lock_handle` | 准入时加锁，`cache_req` 里换锁 | 只改两本账 |
+| `insert_prefix` | `CacheManager.cache_req` | 会加新节点 |
+| `evict` | 空闲槽位不够时的 `CacheManager._allocate` | 删掉叶子 |
+| `check_integrity` | 服务模式空闲时 | 什么也不做，见本章最后 |
+
+另外还有两个抽象方法：`reset` 清空整个缓存，`size_info` 只读两本账，这里不展开。
+
+调度器看到的可用空间是 <Src path="scheduler/cache.py" sym="CacheManager.available_size" />：空闲槽位加上 `evictable_size`。可驱逐的部分算作「可用」，因为真要分配时可以现场驱逐出来。这就是 <StageLink id="s5" /> 里 `_try_allocate_one` 要在加锁前后各检查一次的原因：加锁把一段前缀从 `evictable` 挪到 `protected`，可用空间随之变小。
+
+### 树的节点
+
+<SrcCode path="kvcache/radix_cache.py" sym="RadixTreeNode.__init__" />
+
+每个节点代表一段连续的 token（`page_size = 1` 时，一段可以是任意长度）：
+
+- `_key` 是这段 token 的 id，放在 CPU 上。比较两段 key 用的是 C++ 写的 <Src path="kernel/csrc/src/radix.cpp" sym="fast_compare_key" />，它在 CPU 上找第一个不相等的位置。
+- `_value` 是这段 token 的 KV 在池里的槽位下标，和 `_key` 一样长。它是从 `page_table` 里切出来再 `clone` 的，放在 GPU 上。
+- `children` 用子节点 key 的开头做字典的键：`page_size = 1` 时是第一个 token，否则是第一页 token 组成的元组（`_get_key_fn`）。所以同一个节点下，不会有两个子节点以同一个 token（或同一页）开头。
+- `ref_count` 是引用计数，`timestamp` 是最近一次访问的时间，驱逐时用。根节点的 `ref_count` 初始化为 1，永远不会被驱逐。
+
+从根走到某个节点，把沿途的 `_value` 拼起来，就是这条前缀的全部槽位，这正是 `RadixCacheHandle.get_matched_indices` 做的事。
+
+### 匹配：少匹配一个 token，必要时分裂
+
+<SrcCode path="scheduler/cache.py" sym="CacheManager.match_req" />
+
+匹配时只拿 `input_ids[: input_len - 1]` 去树里找。原因是树里只存 KV，不存 logits。就算整个 prompt 都在树里，也至少要把最后一个 token 真正算一遍，才能拿到它位置上的 logits、采样出第一个输出 token。<Src path="core.py" sym="Req.__post_init__" /> 里的断言 `cached_len < device_len` 也要求至少有一个 token 要算。
+
+<SrcCode path="kvcache/radix_cache.py" sym="RadixPrefixCache._tree_walk" mark={['node = node.split_at(match_len)']} />
+
+从根往下走，每一步：
+
+1. 用剩余输入的开头查 `children`，查不到就停。
+2. 查到了就比较这个子节点的 key 和剩余输入，得到公共长度，再向下对齐到 `page_size` 的整数倍。
+3. 整个节点都匹配上，就更新它的 `timestamp`，继续往下走。
+4. 只匹配了一部分，就在匹配到的位置**分裂**这个节点，返回分裂出来的上半段。
+
+所以 `match_prefix` 虽然在接口文档里写着「不修改缓存」，实际上会改树的形状。它不改的是两本账：分裂前后树里的 token 总数不变，每一段的锁状态也不变。
+
+<SrcCode path="kvcache/radix_cache.py" sym="RadixTreeNode.split_at" />
+
+分裂时新建的是**上半段**，原节点变成下半段、挂到新节点下面。两点值得注意：
+
+- 新节点直接继承原节点的 `ref_count`。锁是沿着路径一直加到根的，任何锁住原节点的句柄，也一定锁住了它的上半段，所以两段的计数相同。
+- 已经发出去的句柄仍然指向原节点（现在的下半段）。从它走到根的路径多了一个节点，但拼出来的槽位完全一样，句柄不会失效。
+
+### 加锁：引用计数沿路径一直加到根
+
+<SrcCode path="kvcache/radix_cache.py" sym="RadixPrefixCache.lock_handle" />
+
+加锁从句柄的节点出发，一路走到根（不含根），每个节点的 `ref_count` 加 1；某个节点从 0 变成 1 时，它的长度从 `evictable` 挪到 `protected`。解锁反过来。
+
+这样做保证了一个性质：**父节点的 `ref_count` 不小于所有子节点的 `ref_count` 之和**（根节点除外，它的计数固定是 1）。于是一个没被锁住的节点，它的整棵子树都没被锁住。驱逐时只要从叶子一层层往上摘，就能摘到所有 `evictable` 的部分，不会有一个可驱逐的节点被锁住的子孙挡住。
+
+两个请求共享同一段前缀时，这段前缀上的计数是 2。一个请求结束只减掉自己的 1，另一个请求仍然保护着它。
+
+### 插入与 `cache_req`：几个长度，几段区间
+
+<SrcCode path="kvcache/radix_cache.py" sym="RadixPrefixCache.insert_prefix" />
+
+插入先把长度向下对齐到整页，然后沿树走一遍（可能分裂），没匹配上的部分作为一个新节点挂上去，新节点没被锁，长度直接记进 `evictable`。返回两个东西：
+
+- `InsertResult.cached_len`：插入**之前**树里已经有的长度，也就是这次走树匹配到的长度。
+- `handle`：指向这条前缀末端的句柄，它的 `cached_len` 是插入之后树里这条前缀的长度，也就是对齐后的插入长度。
+
+调用它的是 `cache_req`，开头那段注释是整章最值得逐行对照的地方：
+
+<SrcCode path="scheduler/cache.py" sym="CacheManager.cache_req" mark={['self._free(page_indices[old_handle.cached_len : cached_len])', 'self._free(page_indices[new_handle.cached_len :])']} />
+
+四个长度，从小到大排好：
+
+- `old_handle.cached_len`：准入时匹配到的长度，这段槽位本来就属于树，请求只是借用。
+- `cached_len`：这次插入前树里已经有的长度。
+- `new_handle.cached_len`：插入后树里这条前缀的长度，等于 `req.cached_len` 向下对齐到整页。
+- `req.cached_len`：这个请求已经算好 KV 的长度，`[0, req.cached_len)` 都能被 attention 读到。
+
+对应的四段区间和处理方式：
+
+| 区间 | 是什么 | 怎么处理 |
+| --- | --- | --- |
+| `[0, old_handle.cached_len)` | 准入时就在树里，请求借用的 | 不动，解锁旧句柄即可 |
+| `[old_handle.cached_len, cached_len)` | 请求自己算的，但算完时树里已经有了一份 | 重复了，还回空闲列表 |
+| `[cached_len, new_handle.cached_len)` | 请求自己算的，树里还没有 | 交给树，变成新节点 |
+| `[new_handle.cached_len, req.cached_len)` | 不满一页的尾巴，插不进树 | 请求结束时释放，没结束就继续留着用 |
+
+第二段为什么会出现？一种情况是两个请求带着相同的前缀几乎同时进来，准入时树里都还没有，两个都从头算，先完成的那个插进树里，后完成的就发现自己算的是重复的。下面的例子里还会看到另一种：少匹配的最后一个 token，树里其实有，但请求为了拿 logits 又算了一遍。
+
+`page_size = 1` 时最后一段总是空的。`page_size > 1` 时，不满一页的尾巴留在请求手里，等它结束再释放。
+
+`cache_req` 在两个时机被调用（<StageLink id="s5" /> 讲过）：
+
+- prefill 算完、请求还没结束：`finished=False`。把刚算好的 prompt 插进树，然后把请求手上的锁换成新句柄，让它在 decode 期间一直保护这段前缀。
+- 请求结束：`finished=True`，由 `_free_req_resources` 调用。把整条序列插进树、解锁、释放尾巴。之后这段 KV 就全部归树管，成为可驱逐的部分。
+
+注意插入的是 `input_ids[: req.cached_len]`，而不是全部 `input_ids`。最后一个采样出的 token 从没作为输入算过，它没有 KV。
+
+### 一个完整的例子：同一个 prompt 连续生成三次
+
+实测记录里有这样一组数：最小配置，prompt 是 `"The capital of France is"`（5 个 token），贪心解码，`max_tokens=16`，同一个 `LLM` 连续生成 3 次，每次之后读 `evictable_size`，得到 20、30、30。第 2 次的输出和第 1 次不同（原因见[实测记录](../../appendix/measurements/)），第 3 次和第 2 次相同：
+
+| 第几次 | 输出的 16 个 token |
+| --- | --- |
+| 1 | ` Paris` `.` ` The` ` capital` ` of` ` France` ` is` ` also` ` the` ` capital` ` of` ` the` ` Republic` ` of` ` France` `.` |
+| 2、3 | ` Paris` `.` ` The` ` capital` ` of` ` Italy` ` is` ` Rome` `.` ` The` ` capital` ` of` ` Spain` ` is` ` Madrid` `.` |
+
+两次输出的前 5 个 token 相同，从第 6 个开始分叉。下面先按关掉 overlap 的顺序执行来推（每批的收尾紧跟在这批之后），最后再说 overlap 模式有什么不同。
+
+**第 1 次。** 树是空的，匹配长度 0，句柄指向根，加锁什么也不做。prefill 算完 5 个 prompt token 后，`cache_req(finished=False)` 把这 5 个插进树，成为节点 X，并锁住它：`evictable` 0，`protected` 5。之后 decode 15 步。第 16 个 token 采样出来时 `req.cached_len` 是 20，请求结束，插入前 20 个 token：X 整段匹配，剩下的 15 个成为新节点 Y，`evictable` 加 15；再解锁 X，加 5。**合计 20**，正好是 5 + 16 − 1。
+
+**第 2 次。** 这次复杂一些，一步步看：
+
+| 时刻 | 发生了什么 | `evictable` | `protected` |
+| --- | --- | --- | --- |
+| 开始前 | 树里是 X(5) 和 Y(15)，都没被锁 | 20 | 0 |
+| 匹配 | 只拿前 4 个 token 去匹配，X 只匹配上 4 个，于是在 4 处分裂成 X1「The capital of France」和 X2「 is」 | 20 | 0 |
+| 加锁 | 锁住 X1，`cached_len = 4`，prefill 只算 1 个 token（位置 4 的「 is」），写进一个新槽位 | 16 | 4 |
+| prefill 后 | 插入 5 个 token：X1、X2 全部匹配，树里已经有了，不加新节点。解锁 X1，位置 4 的新槽位属于第二段区间，还回去；锁住 X2 这条路径 | 15 | 5 |
+| 结束 | 插入 20 个 token：走过 X1、X2，在 Y 里只匹配上 5 个，把 Y 分裂成 Y1(5) 和 Y2(10)；剩下 10 个成为新节点 Z。位置 5 到 9 的槽位是重复的，还回去。解锁 X2 这条路径 | 30 | 0 |
+
+最后一行：原来的 20，加上新节点 Z 的 10，**合计 30**。
+
+**第 3 次。** 匹配前 4 个 token 时正好走完 X1，不用分裂。prefill 后和第 2 次一样还回位置 4 的重复槽位。结束时插入的 20 个 token 沿 X1、X2、Y1、Z 全部匹配上，`InsertResult.cached_len` 是 20，没有新节点。位置 5 到 19 这 15 个槽位全部属于第二段区间，统统还回去。解锁后 `evictable` 回到 **30**，树一点没长。
+
+<Mermaid
+  caption="关掉 overlap 时，第 1 次和第 2 次生成之后的树。方框里是这一段的 token 和长度，所有节点的 ref_count 都是 0。第 3 次生成完全走已有的路径，树不变。"
+  code={`flowchart LR
+  subgraph T1["第 1 次之后：evictable = 20"]
+    r1((root)) --> x["X：The capital of France is（5）"]
+    x --> y["Y：Paris. The capital of France is also the capital of the Republic of France（15）"]
+  end
+  subgraph T2["第 2 次之后：evictable = 30"]
+    r2((root)) --> x1["X1：The capital of France（4）"]
+    x1 --> x2["X2：is（1）"]
+    x2 --> y1["Y1：Paris. The capital of（5）"]
+    y1 --> y2["Y2：France is also the capital of the Republic of France（10）"]
+    y1 --> z["Z：Italy is Rome. The capital of Spain is Madrid（10）"]
+  end`}
+/>
+
+<Aside type="note" title="overlap 模式下树的形状不同，数字相同">
+实测用的最小配置开着 overlap。<StageLink id="s5" /> 讲过，overlap 模式下 prefill 批的收尾发生在下一批 decode 发射之后，那时 `complete_one` 已经把 `req.cached_len` 又推进了一格。所以 prefill 后那次 `cache_req` 插入的是 6 个 token（prompt 加第 1 个输出 token），而不是 5 个。第 1 次之后树是 `[6]` 和 `[14]`；第 2 次匹配时分裂成 `[4]`、`[2]`，结束时再把 `[14]` 分裂成 `[4]` 和 `[10]`，新加一个 `[10]`。总数仍然是 20、30、30。上面按顺序执行推出来的树，要设环境变量 `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` 才能看到。这两种树形都是按代码推出来的，实测记录只记了 `evictable` 的数字，动手实验第 1 步可以自己打印出来核对。
+</Aside>
+
+### 驱逐：只摘叶子，按最久未用
+
+<SrcCode path="kvcache/radix_cache.py" sym="RadixPrefixCache.evict" />
+
+<Src path="scheduler/cache.py" sym="CacheManager._allocate" /> 发现空闲槽位不够时，才向树要 `(needed_pages − free_pages) × page_size` 个 token：
+
+1. 收集所有 `ref_count == 0` 的叶子，按 `timestamp` 建一个最小堆。
+2. 每次弹出最久没访问的叶子，把它整个删掉，槽位还回去。
+3. 父节点如果因此变成了叶子、而且没被锁，就把它也放进堆里。
+4. 删够了为止。
+
+两点要注意。第一，驱逐的单位是整个节点，最后一个节点可能比还差的数量大，所以实际驱逐的可能比要求的多，多出来的也进了空闲列表。第二，只有叶子能被摘，一个刚刚被访问过的叶子，可能比一个很久没用的内部节点先被驱逐。
+
+拿上面第 3 次之后的树做个思想实验：假设空闲列表空了，要驱逐 12 个。Y2 是第 1 次结束时建的，之后再没被访问过（第 2 次分裂 Y 时，刷新时间戳的是分裂出来的上半段 Y1），时间戳最旧，先被删，得到 10 个；这时 Y1 还有子节点 Z，不是叶子，堆里只剩 Z，它虽然是第 3 次刚访问过的，也只能删掉，再得到 10 个。一共驱逐 20 个，比要求的 12 个多 8 个。
+
+### naive 缓存：什么都不缓存
+
+<SrcCode path="kvcache/naive_cache.py" sym="NaivePrefixCache" />
+
+`cache_type="naive"` 时，匹配永远返回长度 0，插入永远返回 `InsertResult(0, ...)`，两本账永远是 0。代入 `cache_req`：`old_handle.cached_len`、`cached_len`、`new_handle.cached_len` 都是 0，于是 `finished=True` 时整个 `page_indices` 都当作尾巴释放。实测里 naive 的 `evictable` 三次都是 0，三次输出完全一样，因为每次都从头算。
+
+naive 关掉的只是**跨请求**的复用。一个请求 decode 时照样读自己前面所有 token 的 KV，这是 KV cache 本身，和前缀缓存无关。
+
+### 值得怀疑的一处：还回去的槽位，请求还在读
+
+回到第 2 次生成的「prefill 后」那一步。位置 4 的新槽位（记作 s）被当作重复的还回了空闲列表，可是这个请求 `page_table` 那一行的第 4 列，仍然写着 s。`cache_req` 里没有任何一行去改 `page_table`。之后每一步 decode，attention 后端都按 `page_table[table_idx, : device_len]` 读 KV（<StageLink id="s7" />），读到的位置 4 就是 s。
+
+s 已经在空闲列表里了，迟早会分给别的请求、被写进别的 KV。从那一刻起，这个请求在位置 4 读到的就是别人的数据。空闲列表是从头部分配、往尾部还的，s 排在最后，要等前面的槽位都分完才会轮到它：KV 池很空时（比如实测的小例子）请求早就结束了，看不出问题；KV 池接近满、空闲列表很短时，就可能真的发生。
+
+<Aside type="caution" title="这是读代码推出来的，没有实测复现">
+同样的情况出现在 `cache_req(finished=False)` 释放 `[old_handle.cached_len, cached_len)` 的任何时候：相同前缀的请求同时进来、或者同一个 prompt 重复出现。一个自然的修法是在释放之前，把树里那一份的槽位写回请求的 `page_table`，让请求改读树里的副本，见动手实验第 4 步。写作时（上游 `9a91cfa`）在 issue 和 PR 里没有找到对这个问题的报告。
+</Aside>
+
+### `check_integrity` 什么也没检查（issue #149）
+
+<SrcCode path="kvcache/radix_cache.py" sym="RadixPrefixCache.check_integrity" />
+
+<SrcCode path="scheduler/cache.py" sym="CacheManager.check_integrity" />
+
+`RadixPrefixCache.check_integrity` 是空的，上游 [issue #149](https://github.com/sgl-project/mini-sglang/issues/149) 报告的就是这件事。外层 `CacheManager.check_integrity` 只核对一笔总账：空闲页数加上树里的页数，等于 KV 池的总页数。它由 <Src path="scheduler/scheduler.py" sym="Scheduler.run_when_idle" /> 调用，也就是服务模式下调度器手上没活、准备阻塞等新消息的时候，这时没有在跑的请求，所有槽位要么空闲、要么在树里，总账才应该平。离线的 `LLM` 用的是自己的 `offline_receive_msg`，从来不调用 `run_when_idle`，所以离线跑的时候连这笔总账都不查。
+
+这笔总账查不出上一节的问题：s 只被还了一次，也不在树里，账是平的。一个真正的 `check_integrity` 至少可以查这些：
+
+- 遍历整棵树，`ref_count` 为 0 的节点长度之和等于 `evictable_size`，大于 0 的等于 `protected_size`。
+- 每个非根节点的 `ref_count` 不小于子节点 `ref_count` 之和；空闲时（没有在跑的请求）所有非根节点的 `ref_count` 都是 0。
+- 每个子节点在父节点 `children` 里的键等于 `key_fn(child._key)`；`_key` 和 `_value` 等长，长度是 `page_size` 的倍数。
+- 所有节点的 `_value` 里没有重复的槽位，而且和空闲列表不相交（这一条要在 `CacheManager` 里查）。
+
+## 常见误区
+
+- **「`match_prefix` 是只读的」**：它会分裂节点、刷新时间戳，改的是树的形状；不改的是两本账。
+- **「加锁会占用新的显存」**：加锁不分配任何槽位，只是把一段前缀从 `evictable` 挪到 `protected`。但调度器的可用空间包含 `evictable`，所以加锁之后可用空间确实变小了。
+- **「请求结束后，它的 KV 就释放了」**：radix 模式下，算过的 KV 挂进树里，变成可驱逐的部分，直到显存不够才被驱逐。只有重复的部分和不满一页的尾巴会马上还回去。
+- **「驱逐就是 LRU，挑最久没用的节点」**：只在没被锁住的叶子里挑最久没用的。刚访问过的叶子可能比很久没用的内部节点先走，而且一删就是整个节点，可能比要求的多。
+- **「naive 模式关掉了 KV cache」**：它只关掉了跨请求的前缀复用，请求内部的 KV cache 照常使用。
+
+## 自测题
+
+1. 匹配前缀时为什么只用 `input_ids[: input_len - 1]`？如果整个 prompt 都在树里，这次 prefill 要算几个 token？
+
+   <Answer>
+   树里只存 KV，不存 logits，要采样出第一个输出 token，最后一个输入 token 必须真正算一遍；`Req` 也断言 `cached_len < device_len`。`page_size = 1` 时，prompt 全在树里的话只算最后 1 个 token。`page_size > 1` 时，匹配长度还要向下对齐到整页，要算的可能更多。
+   </Answer>
+
+2. `split_at` 新建的节点是上半段还是下半段？它的 `ref_count` 为什么直接抄原节点的？
+
+   <Answer>
+   新建的是上半段，原节点变成下半段挂在它下面。锁总是沿路径加到根，锁住原节点的句柄也一定锁住了它的上半段，所以两段的计数一样。已发出的句柄仍指向原节点，拼出来的槽位不变。
+   </Answer>
+
+3. `page_size = 4`，一个 8 个 token 的 prompt 之前已经完整生成过、全部在树里。这次匹配能命中多少个 token？
+
+   <Answer>
+   4 个。匹配只用前 7 个 token，`_tree_walk` 算出公共长度 7，向下对齐到 4 的倍数得到 4，于是在 4 处分裂，命中 4 个，剩下 4 个要重算。
+   </Answer>
+
+4. 第 2 次生成时，prefill 算完的那次 `cache_req(finished=False)` 里，四个长度分别是多少？哪些槽位被还了回去？
+
+   <Answer>
+   `old_handle.cached_len = 4`（准入时命中 X1），`req.cached_len = 5`，插入 5 个 token 时 X1、X2 全部匹配，所以 `cached_len = 5`，`new_handle.cached_len = 5`。区间 `[4, 5)`，也就是位置 4 那个新算的槽位，是重复的，被还了回去。（开着 overlap 时 `req.cached_len` 是 6，还回去的是位置 4 和 5 两个槽位。）
+   </Answer>
+
+5. 第 3 次生成为什么没有让 `evictable` 增加？它算出的那些 KV 去哪了？
+
+   <Answer>
+   它的整条序列（前 20 个 token）在树里都已经存在，插入时匹配长度等于插入长度，没有新节点。它新算的槽位，位置 4 和位置 5 到 19，都属于 `[old_handle.cached_len, cached_len)` 这段重复区间，全部还回了空闲列表。
+   </Answer>
+
+6. 在第 3 次之后的树上要求驱逐 12 个 token，会删掉哪些节点、实际还回多少槽位？
+
+   <Answer>
+   先删时间戳最旧的叶子 Y2（10 个）。Y1 还有子节点 Z，不是叶子，堆里只剩 Z，再删 Z（10 个）。实际还回 20 个，比要求的多 8 个。删完 Z 之后 Y1 变成叶子，会被放进堆里，但已经删够了。
+   </Answer>
+
+7. 离线的 `LLM` 跑的时候会调用 `check_integrity` 吗？服务模式下它能发现什么、发现不了什么？
+
+   <Answer>
+   不会，它只在 `Scheduler.run_when_idle` 里被调用，而离线模式的 `offline_receive_msg` 不调用 `run_when_idle`。服务模式下它只核对「空闲页数 + 树里的页数 = 总页数」，能发现槽位泄漏或多还；树内部的问题（引用计数错、两本账和树不符、槽位重复）它发现不了，因为 `RadixPrefixCache.check_integrity` 是空的（issue #149）。
+   </Answer>
+
+8. 进阶：`cache_req(finished=False)` 还回 `[old_handle.cached_len, cached_len)` 之后，这个请求接下来 decode 时还会读这些槽位吗？什么条件下会读到错误的数据？怎么修？
+
+   <Answer>
+   会。`cache_req` 没有改 `page_table`，请求那一行仍然指向这些已经还回去的槽位，attention 每一步都按 `page_table` 读 KV。空闲列表从头部分配、往尾部还，等这些槽位轮到被分给别的请求并写入新的 KV，这个请求读到的就是别人的数据；KV 池越满、空闲列表越短，越容易发生。修法是在释放前把树里那一份的槽位写回 `page_table` 的这一段，让请求改读树里的副本。这是读代码得出的结论，本站没有实测复现。
+   </Answer>
+
+## 动手实验
+
+<Steps>
+
+1. **复现 20、30、30，并把树打印出来。** 先在纸上画出你预期的树，再运行：
+
+   ```python title="probe_radix.py"
+   from minisgl.core import SamplingParams
+   from minisgl.llm import LLM
+
+   llm = LLM(
+       "Qwen/Qwen3-0.6B",
+       attention_backend="fi",
+       max_seq_len_override=4096,
+       cuda_graph_max_bs=8,
+       memory_ratio=0.5,
+   )
+   cache = llm.cache_manager.prefix_cache
+
+   def dump(node, depth=0):
+       for child in node.children.values():
+           text = llm.tokenizer.decode(child._key.tolist())
+           print("  " * depth + f"[{child.length}] ref={child.ref_count} {text!r}")
+           dump(child, depth + 1)
+
+   for i in range(3):
+       out = llm.generate(["The capital of France is"], SamplingParams(max_tokens=16))
+       print(i + 1, repr(out[0]["text"]), cache.size_info)
+       dump(cache.root_node)
+   llm.shutdown()
+   ```
+
+   直接运行看到的是 overlap 模式下的树；再加上 `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` 运行一次，对照上面的 Mermaid 图。两次的 `evictable_size` 都应该是 20、30、30。再把 `cache_type="naive"` 加进参数、删掉循环里的 `dump(cache.root_node)`（naive 缓存没有树，也没有 `root_node`），确认 `evictable_size` 一直是 0。
+
+2. **把 `cache_req` 的四个长度打出来。** 在 `CacheManager.cache_req` 里、`insert_prefix` 之后加一行，打印 `finished`、`old_handle.cached_len`、`cached_len`、`new_handle.cached_len`、`req.cached_len`。重跑第 1 步，把每一行对到上面第 2 次生成的那张表。开和关 overlap 各跑一次，找出 prefill 后那一行差在哪里。
+
+3. **给 issue #149 写一个真正的 `check_integrity`。** 按「`check_integrity` 什么也没检查」一节列的几条，在 `RadixPrefixCache.check_integrity` 里遍历整棵树并断言；再在 `CacheManager.check_integrity` 里加上「树里的槽位和空闲列表不相交」。离线模式不会自动调用它，在第 1 步的循环里每次 `generate` 之后手动调用 `llm.cache_manager.check_integrity()`。故意改坏一处，确认你的检查能报错。比如删掉 `lock_handle` 加锁分支里的 `self.evictable_size -= node.length`，第 1 次 `generate` 之后账就对不上了。删掉 `split_at` 里继承 `ref_count` 的那一行则不行：第 1 步里分裂发生时节点都没被锁，计数本来就是 0；要两个共享前缀的请求同时在跑，才会分裂一个被锁住的节点，而那时解锁路径上 `lock_handle` 自己的 `assert node.ref_count >= 0` 会先报错。
+
+4. **挑战：修掉「还回去的槽位还在被读」。** 先在 `cache_req` 里 `finished=False` 的分支上，当 `cached_len > old_handle.cached_len` 时打印一行，确认第 1 步的第 2、3 次生成都会走到这里。然后在释放之前，把树里的槽位写回请求的 `page_table`：
+
+   ```python
+   old_len = old_handle.cached_len
+   if cached_len > old_len:
+       tree_indices = new_handle.get_matched_indices()[old_len:cached_len]
+       self.page_table[req.table_idx, old_len:cached_len] = tree_indices
+   ```
+
+   想一想：这次写入在调度器 stream 上，已经发射出去的那一批 decode 读的是哪一份槽位？会不会有问题？改完后重跑第 1 步，输出和 `evictable_size` 应该不变。要真正证明原来的代码会读错，可以用 `num_page_override` 把 KV 池设得很小，让空闲列表很快轮转，再让一个命中前缀的长请求和别的请求同时跑，比较修复前后的输出。
+
+</Steps>
+
+## 过关标准
+
+- 能不看代码，从空树开始画出同一个 prompt 连续生成三次时树的变化，并算出每一步的 `evictable` 和 `protected`。
+- 能说清 `cache_req` 里四个长度的含义，以及每一段区间的槽位最后归谁。
+- 能说出驱逐的规则，并解释为什么实际驱逐的可能比要求的多、为什么刚用过的节点也可能被驱逐。

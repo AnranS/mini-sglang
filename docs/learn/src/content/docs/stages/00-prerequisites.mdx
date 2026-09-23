@@ -1,0 +1,308 @@
+---
+title: 预备知识
+description: KV cache 为什么要分页，prefill 和 decode 有什么不同，为什么推理服务要拼命组批。
+sidebar:
+  order: 0
+  label: 0 · 预备知识
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import Answer from '~/components/Answer.astro';
+import FileTable from '~/components/FileTable.astro';
+import Src from '~/components/Src.astro';
+import SrcCode from '~/components/SrcCode.astro';
+import StageHeader from '~/components/StageHeader.astro';
+import StageLink from '~/components/StageLink.astro';
+
+<StageHeader id="s0" />
+
+## 这一阶段要搞懂什么
+
+这一章不读实现，只把推理服务背后的几个概念讲清楚：模型怎么一个 token 一个 token 地生成，KV cache 缓存的是什么、占多少显存，为什么要分页、组批、复用前缀，以及 CUDA stream、ZeroMQ 这些后面天天见到的工具。每个概念都会落到 mini-sglang 里对应的名字上，并指向讲实现的那一章。已经熟悉的读者可以直接跳到 <StageLink id="s1" />。读完这一章，你应该能回答：
+
+- prefill 和 decode 各算什么？为什么一个卡在算力上、一个卡在访存上？
+- 一个 token 的 KV cache 占多少字节？一张 16 GB 的卡能放下多少个 token？
+- 为什么 KV cache 要分页，为什么服务要拼命组批？
+- 前缀缓存、CUDA graph、张量并行各自解决什么问题？
+- `non_blocking=True` 的拷贝为什么要配合 pinned memory 和 CUDA event 使用？
+
+## 精读清单
+
+这一章不要求精读代码。下面几处是后面各阶段会逐行读的关键位置，先扫一眼，知道这些概念在代码里叫什么、住在哪里就够了。
+
+<FileTable files={[
+  { path: 'core.py', sym: 'Req', note: '一个请求的状态：`cached_len`、`device_len` 这几个长度，在 s2 讲透' },
+  { path: 'engine/engine.py', sym: 'Engine._determine_num_pages', note: '`cache_per_page` 就是本章的 KV 大小公式，在 s4 讲' },
+  { path: 'layers/embedding.py', sym: 'ParallelLMHead.forward', note: 'prefill 时只取每个请求最后一个位置算 logits，在 s3 讲' },
+  { path: 'kvcache/radix_cache.py', sym: 'RadixPrefixCache.match_prefix', note: '前缀缓存的入口，在 s6 讲' },
+  { path: 'engine/graph.py', sym: 'GraphRunner.replay', note: 'CUDA graph 的 replay，在 s7 讲' },
+  { path: 'scheduler/scheduler.py', sym: 'Scheduler.overlap_loop', note: 'CPU 领先 GPU 一拍，在 s5 讲' },
+]} />
+
+## 讲解
+
+### 自回归生成：一次只出一个 token
+
+大语言模型做的事情只有一件：给定一串 token，输出**下一个** token 的概率分布。生成一段回答，就是反复做这件事：
+
+1. 把 prompt 的 token 送进模型，取最后一个位置的输出，采样得到第 1 个新 token。
+2. 把这个新 token 接到序列末尾，再送进模型，采样得到第 2 个新 token。
+3. 一直重复，直到采到结束符（EOS），或者达到用户给的上限 `max_tokens`。
+
+这叫**自回归生成**：每一步的输入依赖上一步的输出，步与步之间没法并行。一个请求要生成 1,000 个 token，就至少要跑 1,000 次前向。
+
+有一个细节后面会反复用到：**采样出一个 token，和算出这个 token 自己的 K/V，是两件事。** 第 1 步采样出的 token，它的 K/V 要等第 2 步把它当作输入送进模型时才算出来。所以一个请求结束时，最后一个输出 token 的 K/V 从来没有算过。<StageLink id="s2" /> 里每次 `complete_one` 之后，`cached_len` 都比 `device_len` 少 1，根源就在这里。
+
+### Prefill 和 decode
+
+同一个请求的前向分成两种：
+
+- **prefill**：第一次前向，把整段 prompt（可能几千个 token）一次送进去，为每个位置算出 K/V，并在最后一个位置得到第 1 个输出 token。
+- **decode**：之后的每一次前向，每个请求只送进 1 个新 token。
+
+两者的瓶颈完全不同。先看一次前向要做什么：把模型的全部权重从显存读进计算单元，和输入做矩阵乘法。对一个 token 来说，乘法的计算量大约是「2 × 参数量」次浮点运算，而读权重的字节数是「参数量 × 每个参数的字节数」，两者是同一个量级。
+
+- prefill 一次处理几千个 token，权重读一遍，被几千个 token 反复使用，算力先被用满，这叫**计算密集**。
+- decode 每个请求只有 1 个 token。如果一次只算一个请求，读一遍全部权重只换来 1 个 token 的计算量，GPU 的算力大部分时间在等显存，这叫**访存密集**。每一步还要把这个请求的全部历史 K/V 读一遍，上下文越长，访存越多。
+
+GPU 的算力和显存带宽之比，通常要每读 1 个字节做上百次运算才能把算力用满（具体数字因卡而异，这里只是量级）。decode 想接近这个比例，唯一的办法是**把很多请求拼成一批**：权重读一遍，同时给一批请求各算 1 个 token。这就是推理服务拼命组批的原因。
+
+mini-sglang 里一个 batch 要么全是 prefill、要么全是 decode（`Batch.phase`），调度器优先安排 prefill，见 <StageLink id="s5" />。prefill 只需要最后一个位置的 logits，所以 LM head 在 prefill 时只挑每个请求的最后一个位置去算：
+
+<SrcCode path="layers/embedding.py" sym="ParallelLMHead.forward" mark={['if batch.is_prefill:']} />
+
+### KV cache 缓存的是什么
+
+Transformer 的每一层 attention 里，每个 token 会算出三个向量：Q（query）、K（key）、V（value）。第 t 个位置的输出，要用它自己的 Q 去和第 0 到 t 个位置的 K 做点积，再用得到的权重对这些位置的 V 加权求和。
+
+关键在于：一个位置的 K 和 V 只取决于它自己和它前面的 token，后面生成了什么不会改变它。所以前面位置的 K、V 算过一次就可以存起来，之后每一步只为新 token 算 Q、K、V，再读出历史的 K、V 做 attention。存起来的这些 K、V 就是 **KV cache**。
+
+KV cache 不是「答案的缓存」，也不是隐藏状态的缓存：它只省掉了重复计算历史 token 的 K、V，新 token 的 attention 仍然要把整段历史读一遍。
+
+**每个 token 占多少？** 每一层都有自己的 K 和 V，每个都是「KV head 数 × head 维度」个数：
+
+```text
+每 token 字节数 = 2（K 和 V）× 层数 × KV head 数 × head_dim × 每个元素的字节数
+```
+
+用 Qwen3-0.6B 的真实配置代进去：28 层、8 个 KV head、`head_dim` 为 128、bfloat16 每个元素 2 字节：
+
+```text
+2 × 28 × 8 × 128 × 2 = 114,688 字节 = 112 KiB
+```
+
+一个 4,096 token 的对话，K/V 就要 4,096 × 112 KiB = 448 MiB。Qwen3-0.6B 有 16 个 query head，却只有 8 个 KV head，每 2 个 query head 共用一组 K/V，这叫 GQA（grouped-query attention），KV cache 因此只有 16 个 head 时的一半。
+
+代码里的公式在 `Engine._determine_num_pages`，多乘了一个 `page_size`，算的是每一页的大小，还会按张量并行的卡数切分 KV head：
+
+<SrcCode path="engine/engine.py" sym="Engine._determine_num_pages" mark={['cache_per_page = (']} />
+
+<Aside type="note" title="实测：112,081 个 token，11.97 GiB">
+在 RTX 4080 SUPER 上用默认参数启动，KV 池有 112,081 个 token，日志里写的 K + V 总大小是 11.97 GiB。对一下：112,081 × 114,688 = 12,854,345,728 字节，除以 2<sup>30</sup> 正好是 11.97 GiB。模型本身只有 0.6B 个参数，bfloat16 下约 1.2 GB（按参数量估算），一张 16 GB 的卡，绝大部分显存都给了 KV cache。KV 池的大小怎么定下来的，见 <StageLink id="s4" />。
+</Aside>
+
+### 为什么要分页
+
+KV cache 放在哪里？最朴素的做法是给每个请求预留一段连续的显存，长度按它最多可能用到的 token 数算。问题是：
+
+- 请求实际生成多少 token，事先不知道。按上限预留，大部分空间浪费；按实际长度分配，又没法在原地变长。
+- 请求有长有短、此起彼伏，释放后显存变得零零碎碎，总空闲量够、却凑不出一段连续空间。
+
+**分页**借用了操作系统虚拟内存的思路：把 KV 池切成固定大小的页，每个请求用一张表记下「第 i 个 token 的 K/V 存在池子里的哪个位置」。请求的 token 在逻辑上是连续的，物理上可以散落在任何地方，用多少分配多少，释放时整页还回去。attention kernel 按这张表去读，这就是 PagedAttention 的想法。
+
+mini-sglang 里这张表叫 `page_table`，是一张二维张量，每一行对应一个正在运行的请求。它存的不是页号，而是每个 token 在 KV 池里的**物理位置**；`page_size` 默认是 1，也就是按 token 分配。这张表的形状见 <StageLink id="s2" />，页怎么分配、写 KV 的 kernel 怎么用它，见 <StageLink id="s4" />。
+
+### 组批和 continuous batching
+
+前面说过，decode 必须组批才能把 GPU 用起来。最简单的组批是**静态批**：凑够一批请求一起开始，等最慢的那个结束，再换下一批。缺点很明显：先结束的请求空占位置，新来的请求要等整批结束。
+
+**Continuous batching**（也叫 iteration-level scheduling）把调度的粒度从「一批请求」缩小到「一步前向」：每跑完一步，结束的请求立刻离开，新请求随时加入。GPU 上跑的 batch 每一步都可能不一样。
+
+mini-sglang 的调度器每一轮都会重新决定这一批算谁：先看有没有新请求可以 prefill，没有就把所有正在 decode 的请求打成一批。正在 decode 的请求集合由 `DecodeManager` 维护，每一步之后用 `filter_reqs` 去掉生成完的请求，见 <StageLink id="s5" />。
+
+还有一个相关的技巧叫 **chunked prefill**：一个很长的 prompt 不一次算完，而是切成几块、分几批算，免得一次 prefill 占住 GPU 太久。mini-sglang 用 `ChunkedReq` 表示还没算完的请求，也在 <StageLink id="s5" /> 讲。
+
+### 前缀缓存
+
+很多请求的开头是一样的：同一个 system prompt、同一段 few-shot 示例、多轮对话里前面的历史。既然 K/V 只取决于前面的 token，那么两个请求只要前缀的 token 完全相同，这段前缀的 K/V 就完全相同，可以直接共用，不用重算。
+
+做法是请求结束后不马上释放它的 KV，而是按 token 序列组织成一棵前缀树（radix tree）。新请求先去树里找最长的公共前缀，命中的部分直接复用，只 prefill 剩下的部分。显存不够时，再按最近最少使用的顺序驱逐没人在用的节点。
+
+mini-sglang 的实现是 `RadixPrefixCache`，另有一个什么都不缓存的 `NaivePrefixCache` 作对照，用 `cache_type` 切换。匹配、加锁、插入、驱逐的细节见 <StageLink id="s6" />。<StageLink id="s1" /> 里有一个实测：同一个 prompt 连续生成，开和不开前缀缓存，输出会不一样。
+
+### CUDA graph
+
+GPU 上的每一个算子都是一次 kernel 启动，由 CPU 发出。一个 28 层的模型跑一步 decode，要发几百个 kernel。decode 时每个 kernel 本身很短，CPU 发射 kernel 的开销就显得很大，GPU 经常空着等 CPU。
+
+**CUDA graph** 的想法是：把一整串 kernel 的发射过程**录**下来，之后一次调用就把整串 kernel 交给 GPU **重放**（replay），省掉逐个发射的开销。代价是录下来的 graph 形状固定、张量地址固定：batch 大小变了就要另录一个，输入必须先拷进录制时用的那几块固定的 buffer。
+
+mini-sglang 只给 decode 用 CUDA graph，启动时按一组 batch 大小各录一个（`GraphRunner`），实际 batch 不在这组大小里时，用指向哑页的 dummy 请求补齐（`pad_batch`）。见 <StageLink id="s7" />。
+
+### 张量并行
+
+模型大到一张卡放不下，或者想让一步前向更快，可以把每一层的权重切开，分给多张卡，每张卡只算自己那一份，这叫**张量并行**（tensor parallelism，TP）。
+
+- 线性层可以按输出维度切（**列并行**），每张卡算出输出的一部分；也可以按输入维度切（**行并行**），每张卡算出一个部分和，再用 **all-reduce** 把各卡的结果加起来。
+- attention 按 head 切，每张卡负责一部分 head，KV cache 也只存自己那部分 KV head（KV head 比卡数少时会复制）。
+
+mini-sglang 里对应的是 `LinearColParallelMerged`、`LinearRowParallel`、`VocabParallelEmbedding` 这些层，每张卡跑一个调度器进程，所有卡必须每一步都算同一批请求。见 <StageLink id="s9" />。
+
+### CUDA stream、event 和 pinned memory
+
+PyTorch 里对 GPU 的操作默认是**异步**的：Python 调用一个 CUDA 算子，只是把 kernel 排进队列就返回，GPU 稍后才真正执行。这个队列叫 **CUDA stream**：
+
+- 同一个 stream 里的操作严格按顺序执行；不同 stream 之间没有顺序保证。
+- `stream_a.wait_stream(stream_b)` 让 a 上后续的操作，等 b 上已经排进去的操作都做完。
+- **CUDA event** 是插在 stream 里的一个标记。`event.record()` 记下「排到这里了」，`event.synchronize()` 让 CPU 等到 GPU 执行到这个标记。
+
+CPU 和 GPU 之间的拷贝也一样。`tensor.to("cuda", non_blocking=True)` 想要真正异步，源张量必须在 **pinned memory**（页锁定内存）里：普通内存可能被操作系统换出，GPU 的 DMA 没法直接从它读，驱动只能先同步地倒一遍。反过来，GPU 拷回 CPU 时用了 `non_blocking=True`，在 CPU 读结果之前必须先等拷贝完成，否则读到的是没写完的数据。
+
+mini-sglang 把这几样用得很彻底：调度器和引擎各有一个 stream（`Scheduler.stream` 和 `Engine.stream`），准备 batch 用的小张量都用 `pin_memory=True` 建好再非阻塞地拷上 GPU，采样结果非阻塞地拷回 CPU，再用 `copy_done_event` 等它拷完。正是这些异步操作让 CPU 能领先 GPU 一拍，这就是 overlap 调度（`overlap_loop`），见 <StageLink id="s5" />。
+
+### 多进程和 ZeroMQ
+
+一个推理服务不止有 GPU 计算，还要收 HTTP 请求、分词、把 token 解码成文字。这些都是 CPU 工作，如果和调度器挤在一个 Python 进程里，会互相拖慢（Python 的 GIL 让同一进程里的线程没法真正并行跑 Python 代码）。所以服务模式下 mini-sglang 拆成多个进程：API server、tokenizer、detokenizer、每张卡一个调度器。子进程用 `multiprocessing` 的 `spawn` 方式启动，每个子进程从头初始化自己的 CUDA 环境。
+
+进程之间用 **ZeroMQ** 传消息。ZeroMQ 是一个消息队列库，提供几种固定的通信模式，mini-sglang 用到两种：
+
+- **PUSH / PULL**：一端推、一端拉，消息排队、按顺序送达，用于 tokenizer 和调度器之间的单向流水线。
+- **PUB / SUB**：一端广播、多端订阅，用于张量并行时 rank 0 把收到的请求转发给其他 rank。
+
+消息本身是 Python 的 dataclass，发送前序列化成字典，再用 msgpack 打包成字节。封装在 <Src path="utils/mp.py" sym="ZmqPushQueue" /> 这几个类里。单进程的离线接口 `LLM` 完全不用这些，调试时方便得多，见 <StageLink id="s1" />；多进程的细节见 <StageLink id="s8" />。
+
+## 常见误区
+
+- **「KV cache 缓存的是模型的输出」**：缓存的是每一层 attention 里历史 token 的 K 和 V。新 token 的 attention 仍然要读完整段历史，只是不用重算它们。
+- **「decode 每步只算一个 token，所以很快」**：计算量小，但每一步都要把全部权重和历史 K/V 读一遍。单个请求 decode 时 GPU 的算力大部分闲着，只有组批才能用起来。
+- **「分页是为了让 KV cache 占的显存变少」**：分页不减少每个 token 需要的字节数，它减少的是预留和碎片造成的浪费，让同样大的 KV 池能同时装下更多请求。
+- **「`non_blocking=True` 就一定是异步拷贝」**：从 CPU 拷到 GPU 时，源张量不在 pinned memory 里，这次拷贝实际上还是同步的。
+- **「CUDA graph 让 kernel 本身算得更快」**：kernel 还是那些 kernel，省掉的是 CPU 逐个发射的开销。所以它对 kernel 很短的 decode 最有用。
+
+## 自测题
+
+1. 一个 prompt 有 10 个 token，`max_tokens=5`，中途没有遇到 EOS。它一共要做几次前向？最后有几个 token 的 K/V 被算过？
+
+   <Answer>
+   1 次 prefill 加 4 次 decode，共 5 次：prefill 采样出第 1 个输出 token，之后每次 decode 再出 1 个。算过 K/V 的是 10 个 prompt token 加前 4 个输出 token，共 14 个；第 5 个输出 token 只被采样出来，从没作为输入送进模型。
+   </Answer>
+
+2. 为什么说 prefill 是计算密集、decode 是访存密集？这对调度有什么启发？
+
+   <Answer>
+   一次前向要把全部权重读一遍。prefill 一次处理很多 token，每个读进来的权重被用很多次，算力先用满；decode 每个请求只有 1 个 token，读一遍权重只做一点点计算，时间花在读显存上，还要读每个请求的历史 K/V。启发是 decode 要把尽可能多的请求拼成一批，让读一次权重服务更多请求。
+   </Answer>
+
+3. 某个模型有 32 层、8 个 KV head、`head_dim` 为 128，用 bfloat16 存 KV。每个 token 的 KV cache 多大？1 GiB 能放多少 token？
+
+   <Answer>
+   2 × 32 × 8 × 128 × 2 = 131,072 字节，也就是 128 KiB。1 GiB 是 1,048,576 KiB，能放 8,192 个 token。
+   </Answer>
+
+4. Qwen3-0.6B 在 RTX 4080 SUPER 上用默认参数启动，KV 池有 112,081 个 token。验证日志里的 11.97 GiB，并估算 20 个同时进行、每个 4,096 token 的对话需要多少 KV。
+
+   <Answer>
+   112,081 × 114,688 = 12,854,345,728 字节，除以 2<sup>30</sup> 得 11.97 GiB。20 个 4,096 token 的对话是 81,920 个 token，放得下；按字节算是 20 × 448 MiB = 8.75 GiB。
+   </Answer>
+
+5. 分页解决的是什么问题？mini-sglang 的 `page_table` 里存的是什么？
+
+   <Answer>
+   解决按上限连续预留造成的浪费，以及释放后显存碎片化、凑不出连续空间的问题。`page_table` 每行对应一个请求，第 j 列存的是这个请求第 j 个 token 的 K/V 在 KV 池里的物理位置（不是页号），attention kernel 和写 KV 的 kernel 都按它寻址。
+   </Answer>
+
+6. continuous batching 和静态批相比，改变的是什么？
+
+   <Answer>
+   调度的粒度从「一批请求」变成「一步前向」。每一步之后，结束的请求马上离开、新请求可以加入，不用等整批里最慢的请求结束，GPU 上的 batch 每一步都可能不同。
+   </Answer>
+
+7. 两个请求的 prompt 前 100 个 token 相同，第 101 个不同。前缀缓存能帮第二个请求省掉多少计算？为什么不能更多？
+
+   <Answer>
+   最多省掉前 100 个 token 的 prefill。第 101 个 token 不同，从它开始的每个位置的 K/V 都依赖它，和第一个请求不一样，必须重算。
+   </Answer>
+
+8. 进阶：GPU 采样出的 token 用 `non_blocking=True` 拷回 CPU，CPU 紧接着读这个张量，会有什么问题？mini-sglang 怎么避免？
+
+   <Answer>
+   拷贝只是排进了 stream，CPU 读的时候 GPU 可能还没执行到，读到的是旧数据或者没写完的数据。mini-sglang 在 `Engine.forward_batch` 里拷贝之后记录一个 `copy_done_event`，调度器在 `_process_last_data` 里先 `copy_done.synchronize()` 再读结果。
+   </Answer>
+
+## 动手实验
+
+<Steps>
+
+1. **手算，再对日志。** 打开 Qwen3-0.6B 的 `config.json`（Hugging Face 缓存目录里，或者模型页面上），找到 `num_hidden_layers`、`num_key_value_heads`、`head_dim`，算出每 token 的 KV 大小。<StageLink id="s1" /> 跑起来之后，从日志里找到 `Allocating ... tokens for KV cache, K + V = ...` 这一行，用你算出的数对一下。
+
+2. **手写一个带 KV cache 的贪心生成。** 用 Hugging Face transformers 写，prefill 一次、之后每步只喂 1 个 token，并在每一步打印 KV cache 里存了多少个 token：
+
+   ```python title="hf_kv_cache.py"
+   import torch
+   from transformers import AutoModelForCausalLM, AutoTokenizer
+
+   name = "Qwen/Qwen3-0.6B"
+   tok = AutoTokenizer.from_pretrained(name)
+   model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.bfloat16).cuda()
+
+   ids = tok("The capital of France is", return_tensors="pt").input_ids.cuda()
+   with torch.inference_mode():
+       out = model(ids, use_cache=True)  # prefill：整段 prompt 一次送进去
+       past = out.past_key_values
+       next_id = out.logits[:, -1].argmax(-1, keepdim=True)
+       generated = [next_id.item()]
+       for step in range(15):  # decode：每步只送 1 个 token
+           print(step, "KV 里的 token 数:", past.get_seq_length())
+           out = model(next_id, past_key_values=past, use_cache=True)
+           past = out.past_key_values
+           next_id = out.logits[:, -1].argmax(-1, keepdim=True)
+           generated.append(next_id.item())
+   print(tok.decode(generated))
+   ```
+
+   先预测第 0 步打印的数是多少、每步增加多少，再运行。然后把 decode 循环改成每步把整段序列重新送进去、不传 `past_key_values`，比较两种写法各跑 200 步的耗时。
+
+3. **看 pinned memory 的效果。** 分别用普通内存和 pinned memory 做一次非阻塞拷贝，观察调用本身返回用了多久、真正拷完用了多久：
+
+   ```python title="pinned.py"
+   import time
+   import torch
+
+   torch.zeros(1, device="cuda")  # 先初始化 CUDA，免得算进第一次拷贝
+   x = torch.randn(64, 1024, 1024)  # 256 MiB，普通内存
+   for src in (x, x.pin_memory()):
+       torch.cuda.synchronize()
+       t0 = time.perf_counter()
+       y = src.to("cuda", non_blocking=True)
+       t1 = time.perf_counter()
+       torch.cuda.synchronize()
+       t2 = time.perf_counter()
+       print(f"pinned={src.is_pinned()}  调用返回 {t1 - t0:.4f} s  拷完 {t2 - t0:.4f} s")
+   ```
+
+   两种情况下「调用返回」的时间差别大吗？想想这和 overlap 调度有什么关系。
+
+4. **ZeroMQ 加 msgpack 的最小例子。** 在一个进程里建一对 PUSH / PULL socket，发一条字典消息：
+
+   ```python title="zmq_demo.py"
+   import msgpack
+   import zmq
+
+   ctx = zmq.Context()
+   pull = ctx.socket(zmq.PULL)
+   pull.bind("ipc:///tmp/minisgl_demo")
+   push = ctx.socket(zmq.PUSH)
+   push.connect("ipc:///tmp/minisgl_demo")
+
+   push.send(msgpack.packb({"uid": 0, "input_ids": [1, 2, 3]}, use_bin_type=True))
+   print(msgpack.unpackb(pull.recv(), raw=False))
+   ```
+
+   然后把发送端挪到另一个进程里，再对照 <Src path="utils/mp.py" sym="ZmqPushQueue" /> 和 <Src path="utils/mp.py" sym="ZmqPullQueue" />，看 mini-sglang 在这个基础上多做了什么。
+
+</Steps>
+
+## 过关标准
+
+- 能不看资料写出每 token KV 大小的公式，并用 Qwen3-0.6B 的配置算出 114,688 字节。
+- 能用一两句话说清 prefill 和 decode 的区别，以及为什么 decode 必须组批。
+- 能说出分页、前缀缓存、CUDA graph、张量并行、overlap 调度各自解决什么问题，以及在 mini-sglang 的哪个阶段讲。

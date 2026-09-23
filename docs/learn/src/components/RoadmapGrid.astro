@@ -1,0 +1,15 @@
+---
+import Roadmap from './react/Roadmap';
+import { STAGES } from '../data/stages.mjs';
+import { pageUrl } from '../lib/urls';
+
+const stages = STAGES.map(({ id, n, title, time, summary, slug }) => ({
+	id,
+	n,
+	title,
+	time,
+	summary,
+	href: pageUrl(slug),
+}));
+---
+<Roadmap client:load stages={stages} />

@@ -1,0 +1,21 @@
+---
+// A Mermaid diagram rendered in the browser. The source stays in the page as
+// the no-JS fallback.
+//   <Mermaid caption="..." code={`sequenceDiagram ...`} />
+interface Props {
+	code: string;
+	caption?: string;
+}
+
+const { code, caption } = Astro.props;
+const source = code.trim();
+---
+<figure class="diagram">
+	<pre class="mermaid" data-diagram={source}>{source}</pre>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { renderDiagrams } from '../lib/mermaid-client';
+	renderDiagrams();
+</script>

@@ -1,0 +1,43 @@
+---
+// A code excerpt pulled from the source tree at build time, with real line
+// numbers and a link to the same lines on GitHub.
+//   <SrcCode path="core.py" sym="Req" />
+//   <SrcCode path="scheduler/scheduler.py" sym="Scheduler.overlap_loop" from="blocking =" />
+//   <SrcCode path="engine/engine.py" sym="Engine.__init__" from="# ===== KV" to="dtype=self.dtype," mark={['num_pages + 1']} />
+import { Code } from '@astrojs/starlight/components';
+import { resolveExcerpt } from '../lib/source.mjs';
+
+interface Props {
+	path: string;
+	sym?: string;
+	from?: string;
+	to?: string;
+	toEnd?: boolean;
+	maxLines?: number;
+	title?: string;
+	mark?: string | string[];
+	ins?: string | string[];
+	del?: string | string[];
+	wrap?: boolean;
+}
+
+const { path, sym, from, to, toEnd, maxLines, title, mark, ins, del, wrap } = Astro.props;
+const ex = resolveExcerpt({ path, sym, from, to, toEnd, maxLines });
+const shown = ex.rel.replace(/^python\//, '');
+---
+<div class="src-code">
+	<Code
+		code={ex.code}
+		lang={ex.lang}
+		title={title ?? shown}
+		showLineNumbers
+		startLineNumber={ex.start}
+		mark={mark}
+		ins={ins}
+		del={del}
+		wrap={wrap}
+	/>
+	<a class="src-code-link" href={ex.url} target="_blank" rel="noopener">
+		在 GitHub 上查看 {shown} 第 {ex.start}–{ex.end} 行 ↗
+	</a>
+</div>

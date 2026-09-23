@@ -1,0 +1,74 @@
+---
+title: Mini-SGLang 源码学习
+description: 跟着一个请求读懂 mini-sglang：请求旅程图、五个心智模型、11 个学习阶段和代码地图。
+template: splash
+tableOfContents: false
+editUrl: false
+lastUpdated: false
+hero:
+  title: 跟着一个请求，读懂 Mini-SGLang
+  tagline: mini-sglang 用大约 8,000 行 Python 实现了 SGLang 最核心的机制：radix cache、chunked prefill、overlap 调度、CUDA graph 和张量并行。这份指南按一个请求的生命周期分成 11 个阶段，每个阶段都有精读清单、讲解、自测题和动手实验。
+  actions:
+    - text: 从阶段 1 开始
+      link: stages/01-run-and-debug/
+      icon: right-arrow
+    - text: 先补预备知识
+      link: stages/00-prerequisites/
+      variant: secondary
+    - text: 源码仓库
+      link: https://github.com/AnranS/mini-sglang
+      icon: external
+      variant: minimal
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import CodeMap from '~/components/CodeMap.astro';
+import JourneyMap from '~/components/JourneyMap.astro';
+import MentalModels from '~/components/MentalModels.astro';
+import RoadmapGrid from '~/components/RoadmapGrid.astro';
+
+## 一个请求的完整旅程
+
+<p class="home-section-lead">
+  一个请求从 HTTP 进来，到 token 流式返回，要经过四类执行单元、12 个关键函数。点任意一步看它做了什么，代码链接会跳到 GitHub 上的对应行。虚线是 decode 循环：第 4 到第 10 步每生成一个 token 走一遍。
+</p>
+
+<JourneyMap />
+
+## 五个核心心智模型
+
+<p class="home-section-lead">
+  读代码卡住时，先回到这五条。几乎每一段难懂的代码，都是其中某一条的直接后果。
+</p>
+
+<MentalModels />
+
+## 学习路线
+
+<p class="home-section-lead">
+  按顺序走大约 2–3 周。每个阶段页面顶部可以标记进度，这里会自动同步（进度只保存在你的浏览器里）。
+</p>
+
+<RoadmapGrid />
+
+## 代码地图
+
+<p class="home-section-lead">
+  `python/minisgl` 下每个目录负责什么、有多少代码、在哪个阶段读。行数在每次构建时从源码重新统计。
+</p>
+
+<CodeMap />
+
+## 怎么用这份指南
+
+**跟着数据走。** 每读一个函数都问三个问题：这个张量从哪来、形状是什么、接下来谁读它。mini-sglang 的难点几乎都不在算法，而在「同一份数据被谁、在哪个 CUDA stream 上、什么时候读写」。
+
+**先单进程，后多进程。** 阶段 1 到 7 都用 `LLM` 类在一个进程里调试，没有 ZeroMQ、没有子进程，普通断点就能用。多进程服务化放到阶段 8。
+
+**先关 overlap，再开。** 设 `MINISGL_DISABLE_OVERLAP_SCHEDULING=1`，主循环会变成「调度 → 前向 → 处理结果」的顺序执行。看懂顺序版本，再去理解 CPU 和 GPU 错开一拍的版本。
+
+**答完自测题、做完实验才算过关。** 每章的参考答案默认折叠。答不上来就回去读代码，别急着展开。
+
+<Aside type="tip" title="文中的代码和行号不会过时">
+  所有源码链接、代码摘录和行数都在构建时从当前提交的源码里按符号名查出来，代码一改，下一次构建就会自动更新；如果某个函数被删掉或改名，构建会直接失败，而不是留下一个错误的链接。文中的实测数字来自一台 RTX 4080 SUPER（16 GB，算力 8.9）和 Qwen3-0.6B，换一张卡会有差异。
+</Aside>

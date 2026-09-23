@@ -1,0 +1,112 @@
+---
+title: 术语表
+description: 50 个术语的中英文对照和定义，项目特有的名字按代码里的用法解释，并注明在哪一章细讲。
+sidebar:
+  order: 5
+---
+
+import Src from '~/components/Src.astro';
+import StageLink from '~/components/StageLink.astro';
+
+按英文名的字母顺序排列，不区分大小写，中文译名放在括号里。代码里的名字（`cached_len`、`ChunkedReq` 这类）按 mini-sglang 当前代码的用法解释，和别的推理框架里同名的东西不一定是一回事。每条最后是细讲它的章节和定义所在的源码。
+
+## A
+
+- **Abort（取消请求）**：客户端断开连接时，API server 调 `abort_user`：删掉这个 uid 的 `ack_map` 和 `event_map`，发一条 `AbortMsg` 给分词进程，由它转成 `AbortBackendMsg` 发给 scheduler。scheduler 在等待队列或 decode 集合里找到这个请求，马上释放它的表行和 KV。overlap 模式下这个「马上」和还在 GPU 上跑的那一批有竞争，见上游 [PR #111](https://github.com/sgl-project/mini-sglang/pull/111)。见 <StageLink id="s8" />，<Src path="server/api_server.py" sym="FrontendManager.abort_user" />。
+- **`ack_map` 和 `event_map`**：API server 的 `FrontendManager` 按 uid 保存的两张表：已经收到、还没被读走的回复列表，以及唤醒等待者的 `asyncio.Event`。`listen` 会丢弃 uid 不在 `ack_map` 里的回复。正常结束时清理它们的 `del` 写在 `wait_for_ack` 的最后一个 `yield` 之后，而流式和非流式的消费者读到 `finished` 都会 `break`，所以这两行执行不到，见上游 [PR #151](https://github.com/sgl-project/mini-sglang/pull/151)。见 <StageLink id="s8" />，<Src path="server/api_server.py" sym="FrontendManager.ack_map" />。
+- **`allocate_paged`**：每个 batch 发射前，为每个请求这一步要写的 `[cached_len, device_len)` 里还没分配的页分配 KV 槽位，并把每个 token 的物理位置写进 `page_table`。空闲页不够时先从前缀缓存驱逐。见 <StageLink id="s4" />，<Src path="scheduler/cache.py" sym="CacheManager.allocate_paged" />。
+- **Attention backend（attention 后端）**：`BaseAttnBackend` 规定的 5 个方法：`forward`、`prepare_metadata`、`init_capture_graph`、`prepare_for_capture`、`prepare_for_replay`。实现有 `fi`（FlashInfer）、`fa`（FlashAttention）和 `trtllm`。写成 `"fa,fi"` 这样时组成 `HybridBackend`，prefill 批和 decode 批分别交给两个后端，CUDA graph 只用 decode 的那个。见 <StageLink id="s7" />，<Src path="attention/base.py" sym="BaseAttnBackend" />。
+
+## B
+
+- **`BaseOP`**：mini-sglang 自己的层基类，替代 `torch.nn.Module`。`state_dict` 和 `load_state_dict` 靠遍历实例的 `__dict__` 找张量和子层，下划线开头的属性跳过；没有 autograd、hook，也没有参数注册。见 <StageLink id="s3" />，<Src path="layers/base.py" sym="BaseOP" />。
+- **`Batch`**：一次前向的请求集合。`phase` 是 `"prefill"` 或 `"decode"`，同一批不会混合。`input_ids`、`positions`、`out_loc`、`padded_reqs` 由调度器在发射前填好，`attn_metadata` 由 attention 后端填。`size` 是真实请求数，`padded_size` 含补齐用的 dummy 请求。见 <StageLink id="s2" />，<Src path="core.py" sym="Batch" />。
+
+## C
+
+- **Cache handle（缓存句柄）**：前缀缓存匹配或插入后返回的 `BaseCacheHandle`。`cached_len` 是命中的前缀长度，`get_matched_indices()` 给出这段前缀的 KV 在池里的位置。radix 缓存的句柄指向树里的一个节点。请求持有句柄期间要把它锁住，否则这段 KV 可能被驱逐。见 <StageLink id="s6" />，<Src path="kvcache/base.py" sym="BaseCacheHandle" />。
+- **`cache_req`**：把请求 `[0, cached_len)` 的 token 和 KV 位置插进前缀缓存，解锁旧句柄，并释放「插入时发现别的请求已经缓存过」的重复部分。`finished=True` 时再释放插不进树的尾巴；`finished=False` 时改为锁住新句柄继续用。请求结束时、以及非分块的请求做完 prefill 时调用。见 <StageLink id="s6" />，<Src path="scheduler/cache.py" sym="CacheManager.cache_req" />。
+- **`cached_len`**：`Req` 上 KV 已经算过（或者已经排进 GPU 队列）的 token 数，也是这一步输入的起点。新请求的初值是前缀缓存命中的长度；每次 `complete_one` 之后变成原来的 `device_len`。句柄上也有一个 `cached_len`，指命中的前缀长度，两者在请求刚被接纳时相等。见 <StageLink id="s2" />，<Src path="core.py" sym="Req.cached_len" />。
+- **`can_decode`**：`remain_len > 0`，也就是还没生成到 `max_tokens`。为假的请求不会进 decode 集合，`write_tuple` 里它的列号写 -1。`ChunkedReq` 恒为假。见 <StageLink id="s2" />，<Src path="core.py" sym="Req.can_decode" />。
+- **`check_integrity`**：`CacheManager` 的自检：空闲页数加上前缀缓存占的页数必须等于总页数。服务模式下 scheduler 每次空闲、阻塞等消息之前调用；离线的 `LLM` 不调用。它先调前缀缓存自己的 `check_integrity`，而 `RadixPrefixCache` 的这个方法是空的，见上游 [issue #149](https://github.com/sgl-project/mini-sglang/issues/149)。见 <StageLink id="s4" /> 和 <StageLink id="s6" />，<Src path="scheduler/cache.py" sym="CacheManager.check_integrity" />。
+- **`ChunkedReq`（分块 prefill 的请求）**：prompt 剩余的部分超过这一批的 token 预算时，这一批只算一块，请求用 `ChunkedReq` 表示。它的 `can_decode` 恒为假，`append_host` 直接抛异常。GPU 上照样对它采样，但结果写进 -1 列丢掉，收尾时也直接跳过。它带着原来的表行和缓存句柄回到等待队列的最前面，下一轮从新的 `cached_len` 接着切。见 <StageLink id="s5" />，<Src path="scheduler/prefill.py" sym="ChunkedReq" />。
+- **`complete_one`**：`cached_len = device_len`，然后 `device_len += 1`。`Engine.forward_batch` 发射完 kernel、还没拿到结果时就对每个请求调用，所以 CPU 上的长度记账比 GPU 的实际计算先走一步。见 <StageLink id="s5" />，<Src path="core.py" sym="Req.complete_one" />。
+- **`Context`（全局上下文）**：每个进程唯一的一个对象，保存 `page_size`、`page_table`、`kv_cache`、`attn_backend`、`moe_backend`，以及当前正在前向的 `Batch`（由 `forward_batch` 上下文管理器设置和清除）。模型各层用 `get_global_ctx()` 拿这些东西，不用层层传参。见 <StageLink id="s2" />，<Src path="core.py" sym="Context" />。
+- **Continuous batching（连续组批）**：每一步都重新决定 batch 里有哪些请求，结束的请求马上离开，新请求马上可以加入，而不是等一整批全部结束再换下一批。mini-sglang 的调度循环每一轮都这样选批。见 <StageLink id="s0" /> 和 <StageLink id="s5" />，<Src path="scheduler/scheduler.py" sym="Scheduler._schedule_next_batch" />。
+- **CUDA graph**：把一次前向的所有 kernel 录下来，之后用一次 replay 整体提交，省掉 CPU 逐个发射 kernel 的开销。mini-sglang 只给 decode 批录，按一组固定的 batch size 各录一个，不够的用 dummy 请求补齐。实测关掉它后 benchmark 慢 8.5%。见 <StageLink id="s7" />，<Src path="engine/graph.py" sym="GraphRunner" />。
+
+## D
+
+- **`DecodeManager`**：维护正在 decode 的请求集合 `running_reqs`。`_forward` 末尾的 `filter_reqs` 把这一批里还能继续生成的请求并进来、把不能的去掉；每个 decode 批包含集合里的全部请求，按 uid 排序。见 <StageLink id="s5" />，<Src path="scheduler/decode.py" sym="DecodeManager" />。
+- **`DecodeStatus`**：反分词进程给每个 uid 记的增量解码状态：已经收到的 token、已经解码的字符串，以及几个偏移量，用来只发出新增的、完整的字符。遇到不认识的 uid 就新建一个，只在收到 `finished` 的消息后删除。见 <StageLink id="s8" />，<Src path="tokenizer/detokenize.py" sym="DecodeStatus" />。
+- **`DetokenizeMsg`**：scheduler 发给反分词进程的消息，每个请求每生成一个 token 发一条，包含 `uid`、`next_token` 和 `finished`。见 <StageLink id="s8" />，<Src path="message/tokenizer.py" sym="DetokenizeMsg" />。
+- **`device_len`**：`Req` 这一步输入的终点：这一步算的是 `[cached_len, device_len)`，算完后这些位置都有了 KV。它同时是这一步采样出的 token 在 `token_pool` 里的列号。初值是 prompt（分块时是算到这一块为止的 prompt）的长度。见 <StageLink id="s2" />，<Src path="core.py" sym="Req.device_len" />。
+- **Dummy request（dummy 请求）**：引擎启动时建的一个假请求：uid 是 -1，输入是一个 token 0，占 `page_table` 和 `token_pool` 的最后一行（行号等于 `max_running_req`）。它那一行 `page_table` 全部指向 KV 池末尾多分配的一页（哑页），所以它读写的 KV 碰不到真实请求。录 CUDA graph 时用它凑出各个 batch size，replay 前 `pad_batch` 用它把 batch 补齐。见 <StageLink id="s7" />，<Src path="engine/engine.py" sym="Engine.__init__" text="self.dummy_req = Req(" label="Engine.dummy_req" />。
+
+## E
+
+- **`evictable_size` 和 `protected_size`**：前缀缓存里的 token 分两类：没被任何请求锁住、可以驱逐的算 evictable，被至少一个请求锁住的算 protected，两者之和是缓存的总大小。`CacheManager.available_size` 等于 evictable 加上空闲页的 token 数，准入控制按这个数判断放不放得下。实测：一个 5 个 token 的 prompt 生成 16 个 token 后，radix 缓存的 evictable 是 20。见 <StageLink id="s4" /> 和 <StageLink id="s6" />，<Src path="kvcache/base.py" sym="SizeInfo" />。
+- **`extend_len`**：`device_len − cached_len`，这一步要为这个请求算的 token 数。prefill 时是这一块里没有命中缓存的 prompt 长度，decode 时是 1。见 <StageLink id="s2" />，<Src path="core.py" sym="Req.extend_len" />。
+
+## F
+
+- **`finished_reqs`**：上一轮收尾时结束的请求集合。overlap 模式下一个已经结束的请求可能被多排进一批，处理那一批时靠它跳过第二次释放。只保留一轮，因为最多只多算一步。见 <StageLink id="s5" />，<Src path="scheduler/scheduler.py" sym="Scheduler.finished_reqs" />。
+- **FlashInfer**：attention 和采样用的 kernel 库，后端名 `fi`。每一批先 `plan`（在 CPU 上根据各请求的长度准备调度信息，拷到 GPU），再 `run`；`last_event` 保证下一次 `plan` 改写 pinned 缓冲区之前，上一次的拷贝已经完成。每种 kernel 第一次使用时要 JIT 编译：实测冷启动时第一次 `generate` 用了 13.23 s，编译结果缓存下来之后只要 0.235 s。见 <StageLink id="s7" /> 和 <StageLink id="s10" />，<Src path="attention/fi.py" sym="FlashInferBackend" />。
+
+## I
+
+- **`inflight_tokens`**：所有在跑的 decode 请求还剩多少 token 没生成（`remain_len` 之和），`page_size > 1` 时每个请求再加 `page_size − 1`。准入控制的 `reserved_size` 从它开始算。见 <StageLink id="s5" />，<Src path="scheduler/decode.py" sym="DecodeManager.inflight_tokens" />。
+- **`input_tuple` 和 `write_tuple`**：调度器准备的两组二维下标（行号数组、列号数组）。`input_tuple` 指出每个输入 token 在 `token_pool` 和 `page_table` 的哪一行哪一列，用来查出 `input_ids` 和 `out_loc`；`write_tuple` 指出采样结果写回 `token_pool` 的位置，不能继续生成的请求列号是 -1。见 <StageLink id="s5" />，<Src path="scheduler/scheduler.py" sym="_make_input_tuple" />。
+
+## K
+
+- **KV cache 和 KV 池（KV pool）**：KV cache 是每层 attention 算出的 K、V 向量，存下来以后 decode 就不用重算历史 token。mini-sglang 启动时一次性分配一整块 KV 池，形状是 `[2, 层数, 页数, page_size, KV head 数, head_dim]`。Qwen3-0.6B 每个 token 的 K 和 V 共占 114,688 字节。见 <StageLink id="s0" /> 和 <StageLink id="s4" />，<Src path="kvcache/mha_pool.py" sym="MHAKVCache" />。
+
+## L
+
+- **`lock_handle`（引用计数）**：radix 树的每个节点有一个 `ref_count`。加锁时从句柄指向的节点一路走到根，每个节点加 1，从 0 变成 1 的节点从 evictable 挪到 protected；解锁反过来。只有 `ref_count` 为 0 的叶子才能被驱逐，根节点的 `ref_count` 恒为 1。见 <StageLink id="s6" />，<Src path="kvcache/radix_cache.py" sym="RadixPrefixCache.lock_handle" />。
+
+## N
+
+- **Naive cache（不缓存）**：`cache_type="naive"` 时的前缀缓存：匹配永远返回长度 0，插入什么也不存，evictable 恒为 0，所以请求结束时 `cache_req` 把它的 KV 全部释放。用来和 radix 缓存对照。见 <StageLink id="s6" />，<Src path="kvcache/naive_cache.py" sym="NaivePrefixCache" />。
+
+## O
+
+- **`out_loc`**：这一批每个输入 token 的 K、V 要写进 KV 池的物理位置，用 `input_tuple` 从 `page_table` 里查出来，每层 attention 用它写 KV。见 <StageLink id="s4" />，<Src path="core.py" sym="Batch.out_loc" />。
+- **Overlap scheduling（overlap 调度）**：默认的调度循环 `overlap_loop`：先发射第 N+1 批，再处理第 N 批的结果，让 CPU 的调度和收尾与 GPU 的计算重叠。代价是 CPU 调度第 N+1 批时还不知道第 N 批里谁采到了 EOS，已经结束的请求会多算一步。设 `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` 关掉，实测关掉后 benchmark 慢 10%。见 <StageLink id="s5" />，<Src path="scheduler/scheduler.py" sym="Scheduler.overlap_loop" />。
+
+## P
+
+- **`pad_batch`**：能用 CUDA graph 的 decode 批，用 dummy 请求补到第一个不小于它的、录过 graph 的 batch size，结果放在 `Batch.padded_reqs`；不能用 graph 的批不补。见 <StageLink id="s7" />，<Src path="engine/graph.py" sym="GraphRunner.pad_batch" />。
+- **Page（页）和 `page_size`**：KV 分配和释放的最小单位，一页 `page_size` 个 token，默认 1。空闲列表 `free_slots` 存的是每一页第一个 token 的位置，所以都是 `page_size` 的倍数。见 <StageLink id="s4" />，<Src path="scheduler/cache.py" sym="CacheManager.free_slots" />。
+- **`page_table`**：GPU 上的 int32 二维表，`max_running_req + 1` 行，列数是对齐到 32 的 `max_seq_len`。第 i 行第 j 列存的是表行 i 上那个请求第 j 个 token 的 KV 在池里的**物理 token 位置**，不是页号，所以不管 `page_size` 多大都按 token 寻址。见 <StageLink id="s2" /> 和 <StageLink id="s4" />，<Src path="core.py" sym="Context.page_table" />。
+- **Prefill 和 decode**：prefill 一次算完 prompt 的所有 token，计算密集；decode 每步为每个请求只算 1 个新 token，但要读它的全部历史 KV，访存密集。mini-sglang 的一个 batch 要么全是 prefill、要么全是 decode，能凑出 prefill 批时优先跑 prefill。见 <StageLink id="s0" /> 和 <StageLink id="s5" />，<Src path="scheduler/scheduler.py" sym="Scheduler._schedule_next_batch" />。
+- **`PrefillAdder`**：每次凑 prefill 批时新建的帮手，带两个计数：`token_budget` 是这一批还能算多少 token，初值是 `prefill_budget`；`reserved_size` 是已经承诺出去的 KV 空间。它按「prompt 剩余长度加 `max_tokens`」保守地预留，放不下就拒绝，调度器遇到第一个被拒绝的请求就停下。见 <StageLink id="s5" />，<Src path="scheduler/prefill.py" sym="PrefillAdder" />。
+- **Prefix cache（前缀缓存）**：复用相同前缀的 KV，命中的部分不用重算。接口 `BasePrefixCache` 有 `match_prefix`、`lock_handle`、`insert_prefix`、`evict`、`size_info` 和 `check_integrity`，实现有 radix 和 naive 两种。匹配时不用 prompt 的最后一个 token，保证至少有一个 token 要算，才有 logits 可以采样。见 <StageLink id="s6" />，<Src path="kvcache/base.py" sym="BasePrefixCache" />。
+- **PyNCCL**：`minisgl/kernel` 里自己封装的 NCCL 通信器，多卡时替代 `torch.distributed` 做 all-reduce 和 all-gather，单卡时不启用。缓冲区大小见[参数速查](../reference/)。见 <StageLink id="s9" />，<Src path="kernel/pynccl.py" sym="init_pynccl" />。
+
+## R
+
+- **`RadixPrefixCache`**：用 radix 树实现的前缀缓存。每个节点存一段 token（key）和对应的 KV 位置（value），子节点按第一个 token 索引（`page_size > 1` 时按第一页的 token 组成的元组）。匹配停在一个节点中间时，把节点分裂成两段；驱逐时从 `ref_count` 为 0 的叶子里挑最久没被访问的。见 <StageLink id="s6" />，<Src path="kvcache/radix_cache.py" sym="RadixPrefixCache" />。
+- **`remain_len`**：`max_device_len − device_len`，这个请求最多还能再往前走几步。`max_device_len` 在创建 `Req` 时定下，等于当时的 `input_ids` 长度加上 `max_tokens`。见 <StageLink id="s2" />，<Src path="core.py" sym="Req.remain_len" />。
+- **`Req`**：调度器里一个已经被接纳的请求：`input_ids`（CPU 上，收尾时追加新生成的 token）、`table_idx`（表行号）、`cached_len`、`device_len`、`max_device_len`、`uid`、采样参数和缓存句柄。还在等待队列里、没被接纳的请求是 `PendingReq`。见 <StageLink id="s2" />，<Src path="core.py" sym="Req" />。
+
+## S
+
+- **`SamplingParams`**：采样参数：`temperature`（默认 0，即贪心）、`top_k`、`top_p`、`ignore_eos` 和 `max_tokens`（默认 1,024）。HTTP 接口的默认值和它不同，见[参数速查](../reference/)。见 <StageLink id="s2" />，<Src path="core.py" sym="SamplingParams" />。
+- **Stream（调度器 stream 和引擎 stream）**：scheduler 有自己的 CUDA stream，放各种元数据的拷贝；引擎的 stream 跑前向。overlap 模式下发射前向前让引擎 stream `wait_stream` 调度器 stream，反方向没有同步；关掉 overlap 时所有操作都在引擎 stream 上。见 <StageLink id="s5" />，<Src path="scheduler/scheduler.py" sym="Scheduler.run_forever" />。
+
+## T
+
+- **`TableManager`（表行）**：管理 `page_table` 和 `token_pool` 的前 `max_running_req` 行。每个被接纳的请求占一行，`table_idx` 就是行号。空闲行放在一个列表里，`allocate` 用 `pop()` 取，后进先出，刚还回去的行会最先被下一个请求拿到。见 <StageLink id="s2" />，<Src path="scheduler/table.py" sym="TableManager" />。
+- **Tensor parallel（张量并行）**：把每层的权重按列或按行切到多张卡上，每张卡算一部分。行并行的线性层和按词表切分的 embedding 之后做 all-reduce，LM head 之后做 all-gather。每张卡一个 scheduler 进程，rank 0 收消息后广播给其他 rank。见 <StageLink id="s9" />，<Src path="layers/linear.py" sym="LinearRowParallel" />。
+- **`token_pool`**：和 `page_table` 同形状的 int32 GPU 表，存每个表行上的 token id。模型的输入从这里查；采样结果由 GPU 直接写回这里，下一步直接读，不经过 CPU，这是 overlap 能成立的前提。初值全是 0，dummy 请求读的就是 0。见 <StageLink id="s2" />，<Src path="scheduler/table.py" sym="TableManager.token_pool" />。
+
+## U
+
+- **`uid`**：请求的编号。服务模式下由 API server 的 `FrontendManager` 递增分配；离线的 `LLM` 每次 `generate` 都从 0 开始数；dummy 请求是 -1。decode 批按 uid 排序，保证多卡上每个 rank 的请求顺序一致。见 <StageLink id="s8" />，<Src path="server/api_server.py" sym="FrontendManager.new_user" />。
+- **`UserMsg`**：分词进程发给 scheduler 的新请求，包含 `uid`、`input_ids`（CPU 上的 int32 一维张量）和 `sampling_params`。离线模式下由 `LLM.offline_receive_msg` 直接构造。见 <StageLink id="s8" />，<Src path="message/backend.py" sym="UserMsg" />。
+
+## Z
+
+- **ZeroMQ**：进程间传消息的库。mini-sglang 用 push/pull 队列连接 API server、分词进程和 scheduler，用 pub/sub 在 TP rank 之间广播；地址是 `/tmp` 下的 ipc 文件；消息先转成字典，再用 msgpack 编码。见 <StageLink id="s8" />，<Src path="utils/mp.py" sym="ZmqPushQueue" />。

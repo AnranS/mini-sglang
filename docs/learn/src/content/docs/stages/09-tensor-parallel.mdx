@@ -1,0 +1,312 @@
+---
+title: 张量并行
+description: 权重怎么切、每层在哪里通信、多个 rank 怎么保持步调完全一致。
+sidebar:
+  order: 9
+  label: 9 · 张量并行
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import Answer from '~/components/Answer.astro';
+import FileTable from '~/components/FileTable.astro';
+import Mermaid from '~/components/Mermaid.astro';
+import Src from '~/components/Src.astro';
+import SrcCode from '~/components/SrcCode.astro';
+import StageHeader from '~/components/StageHeader.astro';
+import StageLink from '~/components/StageLink.astro';
+
+<StageHeader id="s9" />
+
+## 这一阶段要搞懂什么
+
+<StageLink id="s0" /> 讲过张量并行的想法：把每一层的权重切开分给多张卡，每张卡算一部分，必要时把结果合起来。这一章看 mini-sglang 怎么把它落到代码上。它分成两半：一半在模型里（权重怎么切、在哪里通信），另一半在调度器里（`--tp-size N` 会起 N 个调度器进程，每个进程**各自**做调度，它们必须每一步都做出完全相同的决定）。第二半是 mini-sglang 最容易被忽略的设计。读完这一章，你应该能不看代码回答：
+
+- q、k、v、o、gate、up、down、embedding、LM head 各按哪一维切？KV head 比卡数少时怎么办？
+- 一次前向里有几次 all-reduce、几次 all-gather，分别在哪一层？
+- PyNCCL 和 `torch.distributed` 各管什么？gloo 用来干什么？
+- 多个调度器进程怎么保证收到同样的消息、排出同样的 batch、采样出同样的 token？
+- 为什么各卡空闲显存差太多时，启动会直接报错？
+
+<Aside type="caution" title="这一章没有任何实测">
+写作时只有一张 RTX 4080 SUPER，没有在多卡上跑过 mini-sglang。本章所有关于张量并行运行时行为的说法都来自读代码，文中的数字是按模型配置算出来的，不是测出来的。动手实验里需要多卡的步骤都标出来了，请在多卡机器上自己做、自己观察。
+</Aside>
+
+## 精读清单
+
+<FileTable files={[
+  { path: 'models/weight.py', sym: '_shard_tensor', note: '加载时每个 rank 从完整权重里切出自己那一份，按哪一维切' },
+  { path: 'layers/linear.py', sym: 'LinearQKVMerged', note: '本地的输出维度怎么算，KV head 少于卡数时是多少' },
+  { path: 'layers/linear.py', sym: 'LinearRowParallel', note: '为什么只有这一类层要 all-reduce' },
+  { path: 'layers/embedding.py', sym: 'ParallelLMHead.forward', note: 'all-gather 之后那几行 `view`、`permute` 在重排什么' },
+  { path: 'distributed/impl.py', sym: 'DistributedCommunicator', note: '`plugins[-1]` 是谁，什么时候被换掉' },
+  { path: 'engine/engine.py', sym: 'Engine._init_communication', note: '两种模式下各建了哪些进程组' },
+  { path: 'engine/engine.py', sym: 'Engine._sync_get_memory', note: '一次 all-reduce 怎么同时拿到最小值和最大值' },
+  { path: 'scheduler/io.py', sym: 'SchedulerIOMixin._recv_msg_multi_rank0', note: '为什么除了转发消息，还要广播一个条数' },
+  { path: 'scheduler/decode.py', sym: 'DecodeManager.schedule_next_batch', note: '为什么要按 `uid` 排序' },
+]} />
+
+## 讲解
+
+### 切权重：加载时每个 rank 只取自己那一份
+
+模型在 meta device 上建好之后（<StageLink id="s3" />），每一层的参数形状已经是**本地**的形状。加载权重时，<Src path="models/weight.py" sym="load_weight" /> 每读出一个完整的张量，就交给 `_shard_tensor` 切出当前 rank 那一份：
+
+<SrcCode path="models/weight.py" sym="_shard_tensor" />
+
+三种切法：
+
+- **按第 0 维切**：`q_proj`、`k_proj`、`v_proj`、`gate_proj`、`up_proj`。线性层的权重形状是 `[输出, 输入]`，按第 0 维切就是按输出切，也就是**列并行**：每张卡算出输出的一部分特征。对 q、k、v 来说，输出维是「head 数 × head 维度」，按它平均切就是按 head 切。
+- **按第 1 维切**：`o_proj`、`down_proj`，按输入切，也就是**行并行**。
+- **按词表切**：`embed_tokens` 和 `lm_head`，每张卡拿词表里连续的一段，段长是 `div_ceil(词表大小, 卡数)`。
+- 其他（各种 norm、MoE 的路由 `gate`）不切，每张卡一份完整的。
+
+KV head 比卡数少时不能平均切。这时每张卡只拿一个 KV head，第 `r` 张卡拿第 `r * num_kv_heads // n` 个，相邻的几张卡拿到同一个，也就是**复制**。<Src path="utils/misc.py" sym="div_even" /> 的 `allow_replicate=True` 处理的就是这种情况：要求卡数是 KV head 数的整数倍，然后返回 1。
+
+**先切后拼**是一个容易忽略的顺序。checkpoint 里 q、k、v 是三个张量，mini-sglang 运行时用的是合并后的 `qkv_proj`。`load_weight` 先把 q、k、v 各自切好，再按 q、k、v 的顺序拼起来。于是每张卡的 `qkv_proj` 是「本地的 q，本地的 k，本地的 v」，attention 层直接按本地的 head 数 `split` 就行。如果先拼成完整的 qkv 再按第 0 维平均切，第一张卡会拿到全部的 q 而没有 k、v。`gate_up_proj` 也一样。
+
+<SrcCode path="layers/linear.py" sym="LinearQKVMerged" />
+
+构造函数里算的正是切完之后的本地形状。<Src path="layers/base.py" sym="BaseOP.load_state_dict" /> 加载时会断言形状完全一致，切错了在启动时就会报错，不会悄悄算出错的结果。
+
+以 Qwen3-0.6B 为例（hidden 1,024，16 个 q head、8 个 KV head，head 维度 128，MLP 中间维 3,072，词表 151,936），`--tp-size 2` 时每张卡上的形状按上面的规则算出来是：
+
+| 参数 | 完整形状 | 每张卡的形状 |
+| --- | --- | --- |
+| `qkv_proj.weight` | `[4096, 1024]` | `[2048, 1024]`：8 个 q head 加 4 个 KV head 的 k 和 v |
+| `o_proj.weight` | `[1024, 2048]` | `[1024, 1024]` |
+| `gate_up_proj.weight` | `[6144, 1024]` | `[3072, 1024]` |
+| `down_proj.weight` | `[1024, 3072]` | `[1024, 1536]` |
+| `embed_tokens.weight` | `[151936, 1024]` | `[75968, 1024]` |
+
+KV cache 也跟着切：<Src path="engine/engine.py" sym="Engine._determine_num_pages" /> 里每页的大小用的是本地 KV head 数。按 <StageLink id="s0" /> 的公式，单卡时每个 token 的 K 和 V 占 114,688 字节，`--tp-size 2` 时每张卡只存 4 个 KV head，是 57,344 字节。
+
+### 每层在哪里通信
+
+先看一个 MLP 里列并行和行并行怎么配合：
+
+<Mermaid
+  caption="MLP 的张量并行：输入在每张卡上是完整的一份，列并行的 gate_up_proj 各算一半中间特征，激活函数逐元素做、不需要通信，行并行的 down_proj 各算出一个部分和，最后 all-reduce 相加。"
+  code={`flowchart LR
+    X["x：每张卡一份完整的"] --> G0["rank 0：gate_up 的前一半输出"]
+    X --> G1["rank 1：gate_up 的后一半输出"]
+    G0 --> A0["silu_and_mul"] --> D0["rank 0：down_proj 部分和"]
+    G1 --> A1["silu_and_mul"] --> D1["rank 1：down_proj 部分和"]
+    D0 --> R["all-reduce 求和"]
+    D1 --> R
+    R --> Y["y：每张卡一份完整的"]`}
+/>
+
+列并行的输出正好是行并行需要的输入切片，中间不用通信；只有行并行的输出是部分和，要加起来。attention 也是这个结构：`qkv_proj` 按 head 列并行，每张卡用本地的 head 算 attention（head 之间互不相干），`o_proj` 行并行后 all-reduce。
+
+<SrcCode path="layers/linear.py" sym="LinearRowParallel" mark="y = self._comm.all_reduce(y)" />
+
+整个模型的通信点：
+
+| 位置 | 类 | 切法 | 通信 |
+| --- | --- | --- | --- |
+| 词嵌入 | `VocabParallelEmbedding` | 按词表 | all-reduce |
+| `qkv_proj` | `LinearQKVMerged` | 按 head 切输出 | 无 |
+| attention | `AttentionLayer` | 每张卡算本地的 head | 无 |
+| `o_proj` | `LinearOProj` | 切输入 | all-reduce |
+| `gate_up_proj` | `LinearColParallelMerged` | 切输出 | 无 |
+| `down_proj` | `LinearRowParallel` | 切输入 | all-reduce |
+| MoE 专家 | `MoELayer` | 每个专家切中间维 | all-reduce |
+| 输出层 | `ParallelLMHead` | 按词表 | all-gather |
+
+所以一个 dense 的 decoder 层有 2 次 all-reduce。Qwen3-0.6B 有 28 层，一次前向是 28 × 2 + 1 = 57 次 all-reduce（最后的 1 次在词嵌入），外加 1 次 all-gather。decode 时每次 all-reduce 的数据量只有「batch size × hidden」这么大，延迟比带宽更要紧，这也是下面 PyNCCL 要优化的地方。
+
+**词嵌入**按词表切之后，一个 token id 只落在某一张卡的范围里：
+
+<SrcCode path="kernel/csrc/jit/index.cu" sym="masked_index_kernel" from="const auto pos = indices" to="warp::reset" />
+
+`pos` 是 token id 减去本卡范围的起点。这里是无符号运算，id 比起点小时会绕成一个很大的数，和 id 超过终点一样落进 `else`，输出全 0。于是每个 token 只有一张卡给出真实的向量，其他卡给 0，all-reduce 相加后每张卡都得到完整的嵌入。
+
+**LM head** 反过来：每张卡算出自己那段词表的 logits，形状是 `[bs, V/tp]`，要拼成完整的 `[bs, V]` 才能采样：
+
+<SrcCode path="layers/embedding.py" sym="ParallelLMHead.forward" from="module = self.tied_embedding or self" />
+
+all-gather 沿第 0 维拼接，得到的是 `[tp × bs, V/tp]`：先是 rank 0 的全部 bs 行，再是 rank 1 的。要的却是每一行里 rank 0 的那段在前、rank 1 的在后。所以先 `view` 成 `[tp, bs, V/tp]`，`permute` 成 `[bs, tp, V/tp]`，再合并后两维。`bs == 1` 时两种排列在内存里是同一回事，直接 `view` 就行。最后切到 `num_embeddings`，去掉按 `div_ceil` 向上取整时可能多出的尾巴。
+
+### PyNCCL 和 `torch.distributed`
+
+<SrcCode path="engine/engine.py" sym="Engine._init_communication" />
+
+有两种模式：
+
+- **默认（`use_pynccl=True`）**：`torch.distributed` 只用 gloo 后端建一个进程组，`tp_cpu_group` 就是这个全局组，**只做 CPU 上的通信**（交换 NCCL id、比较显存、广播消息条数、屏障）。GPU 上的 all-reduce、all-gather 交给 mini-sglang 自己封装的 PyNCCL。
+- **`--disable-pynccl`**：`torch.distributed` 用 NCCL 后端建全局组做 GPU 通信，另外用 gloo 建一个组做 CPU 通信。
+
+单卡时也会建一个大小为 1 的 gloo 组，这样 `_sync_get_memory`、`sync_all_ranks` 这些代码不用区分单卡多卡。
+
+各层并不直接调用哪一种实现，而是通过 <Src path="distributed/impl.py" sym="DistributedCommunicator" />：它总是用 `plugins` 列表里的**最后一个**。初始值是 `TorchDistributedImpl`；<Src path="distributed/impl.py" sym="enable_pynccl_distributed" /> 在多卡时往列表末尾追加一个 `PyNCCLDistributedImpl`，之后所有层的通信就都换成了 PyNCCL。
+
+PyNCCL 由 <Src path="kernel/pynccl.py" sym="init_pynccl" /> 创建：rank 0 调 `ncclGetUniqueId` 生成一个 id，用 gloo 的 `broadcast_object_list` 发给其他 rank，每个 rank 再用这个 id 调 `ncclCommInitRank` 加入同一个 NCCL 通信组。C++ 那一侧编译成一个预编译模块（kernel 的编译和加载见 <StageLink id="s10" />）：
+
+<SrcCode path="kernel/csrc/src/pynccl.cu" sym="all_reduce" mark="if (size_bytes <= m_max_bytes) { // use internal buffer" />
+
+- 构造时用 `ncclMemAlloc` 申请一块缓冲区，并用 `ncclCommWindowRegister` 注册成对称内存窗口（`NCCL_WIN_COLL_SYMMETRIC`）。按 NCCL 文档的说法，数据在对称内存里时 NCCL 可以用延迟更低的集合通信 kernel。
+- all-reduce 时，数据不超过缓冲区大小就先拷进缓冲区、原地 all-reduce、再拷回来；超过了直接在原张量上做。all-gather 不走缓冲区，直接写进输出。
+- 缓冲区大小是 `max_forward_len × hidden_size × dtype 字节数`，即一批最多的 token 数乘上一行隐藏状态的大小，再被环境变量 `MINISGL_PYNCCL_MAX_BUFFER_SIZE`（默认 1 GiB）封顶。服务模式下 `max_forward_len` 就是 `max_extend_tokens`，默认 8,192；对 Qwen3-0.6B 的 bfloat16 来说是 8,192 × 1,024 × 2 字节 = 16 MiB。
+- dtype 只映射了 float16 和 bfloat16，用 float32 跑多卡会在查表时失败。
+
+代码没有写明为什么要自己封装一层 PyNCCL 而不是直接用 `torch.distributed` 的 NCCL 后端，从实现看，主要的区别就是上面这块对称内存缓冲区。两者的性能差多少，本书没有测过。
+
+### 各卡显存必须一致
+
+<SrcCode path="engine/engine.py" sym="Engine._sync_get_memory" />
+
+每张卡查自己的空闲显存，然后对 `[free, -free]` 做一次取最小值的 all-reduce：第一个元素得到最小值，第二个元素取负后得到最大值，一次通信拿到两个数。两者相差超过 2 GiB 就报错退出。
+
+为什么这么严格？关键在于后面用的是**同步之后**的值：`Engine.__init__` 用它决定 KV 池有几页，也用它决定默认录哪些 batch size 的 CUDA graph（<StageLink id="s7" />）。每张卡算出来的页数、graph 列表必须完全相同，因为下一节会看到，每个调度器是各自独立做准入和补齐的；页数不同，一张卡接纳的请求另一张卡可能不接纳，整个系统就散了。显存差太多说明卡上还有别的东西在跑，用同一个数去算就可能在显存最少的那张卡上溢出，所以干脆拒绝启动。
+
+一个值得留意的细节：计算 KV 池大小时，代码取的是同步结果里的**最大值**（`_sync_get_memory()[1]`），不是最小值。这意味着显存最少的那张卡最多可能少 2 GiB，要靠 `memory_ratio` 留下的余量来兜住。这是读代码得到的观察，没有在多卡上验证过会不会出问题。
+
+### 多个 rank 怎么保持步调一致
+
+`--tp-size N` 时，<StageLink id="s8" /> 讲过会起 N 个调度器进程。mini-sglang **没有**让 rank 0 做调度、再把 batch 发给其他 rank，而是让每个 rank 都跑一份完整的调度器：各自的等待队列、decode 集合、表、KV 空闲列表、前缀树。每一步它们必须排出完全相同的 batch，否则 all-reduce 会把不同请求的部分和加在一起，结果是错的，甚至因为形状对不上而卡死。
+
+这要求满足四个条件。
+
+**1. 同一轮收到同样的消息。** 只有 rank 0 连着 tokenizer 进程：
+
+<SrcCode path="scheduler/io.py" sym="SchedulerIOMixin._recv_msg_multi_rank0" />
+
+<SrcCode path="scheduler/io.py" sym="SchedulerIOMixin._recv_msg_multi_rank1" />
+
+- rank 0 把收到的**原始字节**原样 PUB 出去，其他 rank 从 SUB 收。转发原始字节，省掉一次重新编码，也保证大家解出来的是同一个对象。
+- 光转发还不够：SUB 端的消息什么时候到是异步的，如果其他 rank 也用「把队列里现有的都取完」的方式收，这一轮可能比 rank 0 少收一条。所以 rank 0 先数好这一轮取了几条，用 gloo 广播这个条数，其他 rank 阻塞地收恰好这么多条。
+- 两边在什么时候阻塞等待也一致：`blocking` 由各自的调度器状态算出来，而状态是一样的。
+
+这个广播每一轮都会做，是一次 CPU 上的集合通信，也就相当于每一轮都有一个松散的同步点。它的开销没有测过。
+
+**2. 资源一样多。** 就是上一节的显存同步：页数相同，CUDA graph 的 batch size 列表相同，`pad_batch` 补齐出来的大小也就相同。
+
+**3. batch 里请求的顺序一样。** prefill 批按等待队列的顺序排，队列是按消息到达顺序追加的，天然一致。decode 批就不一定了：
+
+<SrcCode path="scheduler/decode.py" sym="DecodeManager.schedule_next_batch" />
+
+`running_reqs` 是一个 `set`，而 `Req` 用 `@dataclass(eq=False)` 定义，哈希值来自对象的内存地址。不同进程里同一个请求的地址不同，`set` 的遍历顺序也就不同。如果直接 `list(self.running_reqs)`，rank 0 的第 i 行可能是请求 A、rank 1 的第 i 行是请求 B，形状完全一样，不会报错，但 all-reduce 把 A 和 B 的部分和加在了一起，输出是乱的。按 `uid` 排序就是为了消除这个差异。这个排序是上游 main 最新的一个提交 `9a91cfa`（PR [#113](https://github.com/sgl-project/mini-sglang/pull/113)）才加上的。
+
+**4. 采样出同样的 token。** LM head 的 all-gather 让每张卡拿到同样的完整 logits，每张卡**各自采样**。贪心解码时 `argmax` 结果一定相同。随机采样时，每张卡在 `Engine.__init__` 里都执行了 `torch.manual_seed(42)`，而且按同样的顺序做同样的操作，所以推测随机数序列也相同；这一点依赖 FlashInfer 的采样 kernel 从 PyTorch 的默认生成器取种子，本书没有验证。一旦某一步两张卡采出的 token 不同，它们对「谁遇到了 EOS」的判断就会不同，之后的 batch 大小不同，集合通信就对不上了。
+
+最后是结果的出口：每个 rank 都会生成 `DetokenizeMsg`，但只有 rank 0 真的发出去（<Src path="scheduler/io.py" sym="SchedulerIOMixin._reply_tokenizer_rank1" />）。
+
+把同步点列在一起：
+
+- **启动时**：`init_process_group` 的会合；`init_pynccl` 广播 NCCL id；`_sync_get_memory` 在加载模型前、分配 KV 池前、初始化结束时各做一次；<Src path="server/launch.py" sym="_run_scheduler" text="scheduler.sync_all_ranks()" label="_run_scheduler" /> 里的屏障。
+- **每一轮**：`receive_msg` 里广播消息条数；前向中的每次 all-reduce、all-gather 在 GPU 上天然把各卡对齐。
+- **关闭时**：`Scheduler.shutdown` 里再做一次屏障。
+
+<Aside type="note" title="一个没有被显式保证的地方">
+前缀树的驱逐顺序按节点的时间戳排，时间戳来自每个进程自己的 `time.monotonic_ns()`（<Src path="kvcache/radix_cache.py" sym="RadixTreeNode.__lt__" />）。各进程的时钟不同，但只要大家按同样的顺序做同样的操作，时间戳的**相对**大小是一致的，驱逐的选择也就一致。两个节点时间戳恰好相等时，理论上各卡可能选出不同的节点。这是读代码得到的推测，没有复现过。
+</Aside>
+
+## 常见误区
+
+- **「rank 0 负责调度，其他 rank 只管算」**：每个 rank 都跑一份完整的调度器，自己决定 batch。rank 0 特殊的地方只是它连着 tokenizer 进程，负责转发消息和发回结果。
+- **「张量并行时每张卡都存完整的 KV cache」**：每张卡只存本地的 KV head，每个 token 的 KV 大小按卡数缩小。只有 KV head 少于卡数时才会复制。
+- **「gloo 很慢，所以 mini-sglang 不用它」**：gloo 只负责 CPU 上的小通信：交换 NCCL id、比较显存、每轮广播一个整数、屏障。GPU 上的数据走 NCCL。
+- **「decode 批按 uid 排序是为了性能或公平」**：是为了让各 rank 的 batch 顺序一致，和性能无关。
+- **「单进程的 `LLM` 也能开张量并行」**：`LLM` 把 `tp_info` 写死成 `DistributedInfo(0, 1)`，只支持单卡。要用多卡必须走 <StageLink id="s8" /> 的服务模式。
+
+## 自测题
+
+1. 为什么 q、k、v 要各自先切、再拼成 `qkv_proj`，而不是先拼好再切？
+
+   <Answer>
+   先拼好的 qkv 按第 0 维排列是「全部 q，全部 k，全部 v」，平均切开后第一张卡拿到的全是 q。先各自切再拼，每张卡的 `qkv_proj` 都是「本地的 q，本地的 k，本地的 v」，attention 层按本地的 head 数 `split` 就能得到正确的三段。
+   </Answer>
+
+2. 一个 dense decoder 层里有几次 all-reduce？Qwen3-0.6B 一次前向一共有几次集合通信？
+
+   <Answer>
+   2 次：`o_proj` 后一次，`down_proj` 后一次。28 层共 56 次，加上词嵌入的 1 次 all-reduce，以及 LM head 的 1 次 all-gather，一共 58 次。
+   </Answer>
+
+3. 词嵌入按词表切之后，一个 token 只在一张卡的范围里，其他卡怎么处理它？为什么最后用 all-reduce 而不是 all-gather？
+
+   <Answer>
+   `masked_index_kernel` 把不在本卡范围里的 token 的输出置 0。每个位置只有一张卡给出真实向量，其余都是 0，相加就得到完整的嵌入，所以用 all-reduce。all-gather 是把各卡不同的部分拼起来，而这里每张卡输出的形状都是完整的 `[token 数, hidden]`，要的是合并数值而不是拼接。
+   </Answer>
+
+4. `ParallelLMHead.forward` 里 all-gather 之后为什么要 `permute`？`bs == 1` 时为什么可以跳过？
+
+   <Answer>
+   all-gather 沿第 0 维拼接，结果是 rank 0 的 bs 行在前、rank 1 的 bs 行在后，形状 `[tp × bs, V/tp]`。要的是每一行内部按 rank 拼接的 `[bs, V]`，所以要 `view` 成 `[tp, bs, V/tp]`、换成 `[bs, tp, V/tp]` 再合并。`bs == 1` 时 `[tp, 1, V/tp]` 和 `[1, tp, V/tp]` 在内存里的排列完全相同，直接 `view` 就对了。
+   </Answer>
+
+5. rank 1 怎么知道这一轮要从 SUB 收几条消息？如果它也像单卡那样「把队列里现有的都取完」会出什么问题？
+
+   <Answer>
+   rank 0 取完 tokenizer 队列后，用 gloo 把条数广播出去，rank 1 阻塞地收恰好这么多条。如果 rank 1 自己看队列，PUB / SUB 的投递是异步的，它可能比 rank 0 少看到一条或几条，这一轮两边的等待队列就不同了，排出的 prefill 批不一样，前向时的 all-reduce 会把不同请求的数据加在一起，甚至因为 token 数不同而卡死。
+   </Answer>
+
+6. 如果把 `DecodeManager.schedule_next_batch` 里的 `sorted(..., key=uid)` 改回 `list(self.running_reqs)`，多卡时会怎样？单卡呢？
+
+   <Answer>
+   `Req` 的哈希基于对象地址，不同进程里 `set` 的遍历顺序不同，两个 rank 的 decode 批里同一行可能是不同的请求。batch 的形状相同，所以不会报错，但行并行层的 all-reduce 把不同请求的部分和加在一起，输出变成乱码。单卡时顺序是什么都无所谓，完全没有影响。
+   </Answer>
+
+7. 启动时为什么要检查各卡空闲显存的差距？只让每张卡各自按自己的空闲显存算 KV 池大小，会出什么问题？
+
+   <Answer>
+   每个 rank 的调度器独立做准入控制，依据的是自己的 KV 池大小。如果各卡的页数不同，同一个请求可能在一张卡上被接纳、在另一张卡上被挡住，两边的 batch 从此不同。所以页数必须用同步之后的同一个值来算；差距太大说明有卡被别的程序占着，用同一个值去算就可能在显存最少的卡上溢出，干脆报错。CUDA graph 的 batch size 列表也用这个值来定，同样需要一致。
+   </Answer>
+
+8. 进阶：下面两种情况，按当前代码会发生什么？（1）一个行并行层带 bias；（2）词表大小不能被卡数整除。
+
+   <Answer>
+   （1）`LinearRowParallel.forward` 在每张卡上都用 `F.linear` 加了一次 bias，再 all-reduce 求和，bias 会被加 `tp` 次。当前所有模型的 `o_proj`、`down_proj` 都传 `has_bias=False`，所以没有触发；要支持带 bias 的行并行层，应该只在一张卡上加，或者在 all-reduce 之后再加。
+
+   （2）`VocabParallelEmbedding` 按 `div_ceil` 给每张卡建了一样大的权重，而 `_shard_tensor` 给最后一张卡切出来的那段更短，加载时 `BaseOP.load_state_dict` 的形状断言会失败。`ParallelLMHead` 末尾切到 `num_embeddings` 的写法说明原本考虑过补齐，但加载这一侧没有补。常见模型的词表能被 2、4、8 整除，所以一般碰不到。这两点都是读代码的结论，没有实际运行过。
+   </Answer>
+
+## 动手实验
+
+<Steps>
+
+1. **单卡也能做：切一遍权重、拼一遍 logits。** `_shard_tensor` 只做张量切片，在 CPU 上就能调用。用随机张量模拟 Qwen3-0.6B 的几个权重，打印 `tp` 取 2、4、16 时每个 rank 拿到的形状，先对照上面的表自己预测：
+
+   ```python
+   import torch
+   from minisgl.models.weight import _shard_tensor
+
+   weights = {
+       "model.layers.0.self_attn.q_proj.weight": torch.randn(16 * 128, 1024),
+       "model.layers.0.self_attn.k_proj.weight": torch.randn(8 * 128, 1024),
+       "model.layers.0.self_attn.o_proj.weight": torch.randn(1024, 16 * 128),
+       "model.embed_tokens.weight": torch.randn(151936, 8),
+   }
+   for n in (2, 4, 16):
+       for name, w in weights.items():
+           shapes = [tuple(_shard_tensor(name, w, r, n, 8).shape) for r in range(n)]
+           print(n, name.split(".")[-2], shapes[:3], "...")
+   ```
+
+   `tp=16` 时 k 的形状说明了什么？把 k 的每个分片和原张量比较，找出哪几个 rank 拿到了同一个 KV head。然后用纯 PyTorch 验证 LM head 的重排：
+
+   ```python
+   import torch
+
+   tp, bs, V = 2, 3, 8
+   full = torch.arange(bs * V, dtype=torch.float32).view(bs, V)
+   gathered = torch.cat(full.chunk(tp, dim=1), dim=0)  # all_gather 沿第 0 维拼接
+   out = gathered.view(tp, bs, V // tp).permute(1, 0, 2).reshape(bs, V)
+   assert torch.equal(out, full)
+   ```
+
+   去掉 `permute` 再跑一次，看看错在哪里。
+
+2. **需要多卡：对比单卡和两卡的启动日志。** 在同一台机器上分别用 `--tp-size 1` 和 `--tp-size 2` 启动 `Qwen/Qwen3-0.6B`。先预测，再观察：「Allocating ... tokens for KV cache」这一行的 token 数怎么变？`/tmp` 下是否多出了 `minisgl_2` 开头的套接字？然后跑一下 PyNCCL 自带的测试 `python tests/kernel/test_comm.py`（脚本里把 `tp_size` 写死成 4，按你的卡数改），看它打印的正确性检查、延迟和带宽。
+
+3. **需要多卡：亲手打破步调一致。** 在 `Scheduler._schedule_next_batch` 返回前打印 rank 号和 `[r.uid for r in batch.reqs]`（rank 号可以从 `minisgl.distributed.get_tp_info()` 拿）。用 `--tp-size 2` 启动，同时发 8 个贪心解码的请求，确认两个 rank 每一步打印的列表完全相同。然后把 `DecodeManager.schedule_next_batch` 的排序改回 `list(self.running_reqs)`，重做一遍：观察两个 rank 的顺序是否开始不同，输出文本是否变成乱码。最后和 `--tp-size 1` 的输出对比。
+
+4. **需要多卡：触发显存检查，比较两种通信后端。** 先在另一个终端里用 Python 在第 1 张卡上占 3 GiB 显存（例如 `x = torch.empty(3 << 30, dtype=torch.uint8, device="cuda:1")` 然后停住），再用 `--tp-size 2` 启动服务，观察报错信息和它出现的时机。然后去掉占用，分别用默认参数和 `--disable-pynccl` 启动，用 `minisgl/benchmark` 里的在线压测客户端跑同一组负载，比较吞吐和延迟。
+
+</Steps>
+
+## 过关标准
+
+- 能不看代码说出 Qwen3-0.6B 在 `--tp-size 2` 时每一类权重在每张卡上的形状，以及一次前向里每一次集合通信发生在哪一层。
+- 能解释 PyNCCL、NCCL 后端的 `torch.distributed`、gloo 三者在 mini-sglang 里各自负责什么。
+- 能列出多个调度器进程保持步调一致的四个条件，并说出去掉任意一个会出现什么现象。

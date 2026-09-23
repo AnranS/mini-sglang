@@ -1,0 +1,367 @@
+---
+title: 模型前向
+description: 一个 decoder 层从加载权重到前向计算的每一行，并和 HF transformers 逐层对上。
+sidebar:
+  order: 3
+  label: 3 · 模型前向
+---
+
+import { Steps } from '@astrojs/starlight/components';
+import Answer from '~/components/Answer.astro';
+import FileTable from '~/components/FileTable.astro';
+import Mermaid from '~/components/Mermaid.astro';
+import Src from '~/components/Src.astro';
+import SrcCode from '~/components/SrcCode.astro';
+import StageHeader from '~/components/StageHeader.astro';
+import StageLink from '~/components/StageLink.astro';
+
+<StageHeader id="s3" />
+
+## 这一阶段要搞懂什么
+
+调度器（<StageLink id="s5" />）决定这一批算谁，引擎负责把这一批真正算出来。这一章只看引擎里「模型」那一半：权重怎么从 checkpoint 变成 GPU 上的张量，一批 token 怎么穿过 28 个 decoder 层变成 logits。主线是 Qwen3，其他模型结构大同小异。读完这一章，你应该能不看代码回答：
+
+- 构造模型时为什么要放在 `meta` device 上？RoPE 的 cos/sin 表为什么是例外？
+- checkpoint 里的 `q_proj`、`k_proj`、`v_proj` 到了运行时变成了什么？`lm_head.weight` 去哪了？
+- 一个 decoder 层前向时，每一步的张量是什么形状？残差加在哪里？
+- mini-sglang 的 Qwen3 和 HF transformers 的 Qwen3 在哪些地方一一对应，在哪些地方写法不同但数学上等价？
+
+这一章不讲 attention 后端内部怎么算（<StageLink id="s7" />），也不讲新算出的 K/V 写到哪里（<StageLink id="s4" />），张量并行时权重怎么切只提一句（<StageLink id="s9" />）。
+
+## 精读清单
+
+<FileTable files={[
+  { path: 'engine/engine.py', sym: 'Engine.__init__', note: '只读到 `load_state_dict` 为止：meta device、`create_model`、加载权重' },
+  { path: 'models/config.py', sym: 'ModelConfig.from_hf', note: 'HF 的 config 里哪些字段被读进来，`head_dim` 缺省时怎么算' },
+  { path: 'models/register.py', sym: 'get_model_class', note: '架构名怎么找到 Python 类' },
+  { path: 'layers/base.py', sym: 'BaseOP', note: '不继承 `nn.Module`，靠什么收集和替换权重' },
+  { path: 'models/weight.py', sym: 'load_weight', note: '哪些权重被合并、合并的顺序' },
+  { path: 'models/qwen3.py', sym: 'Qwen3DecoderLayer', note: '`x` 和 `residual` 两条线各自是什么' },
+  { path: 'models/utils.py', sym: 'RopeAttn', note: '`o_proj` 的输入维度为什么不是 `hidden_size`' },
+  { path: 'layers/attention.py', sym: 'AttentionLayer.forward', note: 'q/k norm 和 RoPE 都是就地改的' },
+  { path: 'layers/embedding.py', sym: 'ParallelLMHead.forward', note: 'prefill 时只取哪些位置' },
+]} />
+
+## 讲解
+
+### 从 `Engine.__init__` 到权重就位
+
+<SrcCode path="engine/engine.py" sym="Engine.__init__" to="self.model.load_state_dict" mark={['with torch.device("meta"), torch_dtype(config.dtype):', 'set_rope_device(self.device)']} />
+
+前半段做的是准备工作：`_adjust_config` 把 `"auto"` 的 attention 后端落到具体的名字（<StageLink id="s7" />），选定 `cuda:rank`，建好引擎自己的 CUDA stream，创建全局 `Context`（<StageLink id="s2" />），初始化通信组。`init_free_memory` 是加载模型之前的空闲显存，<StageLink id="s4" /> 会用它算 KV 池的大小。
+
+和模型有关的只有三行：
+
+1. **`set_rope_device`**：先记下真实设备，原因下面讲 RoPE 时再说。
+2. **在 `meta` device 上 `create_model`**。`torch.device("meta")` 下创建的张量只有形状和 dtype，不占显存，也不做初始化。`torch_dtype` 是 <Src path="utils/torch_utils.py" sym="torch_dtype" /> 里的一个上下文管理器，临时把默认 dtype 设成配置里的 dtype（离线的 `LLM` 默认 bfloat16），所以各层里的 `torch.empty(...)` 得到的都是 bfloat16 的 meta 张量。这一步只是把「每个权重长什么样」搭出来，省掉了一次无用的随机初始化和显存分配。
+3. **`load_state_dict`**：把真正的权重换进去。权重来自 <Src path="engine/engine.py" sym="Engine._load_weight_state_dict" />：正常情况下调用 `load_weight` 从 safetensors 读，并逐个 `.to(self.dtype)`；`use_dummy_weight=True` 时按模型自己的 `state_dict` 生成同形状的随机张量，不用下载 checkpoint 也能把流程跑通。
+
+### 模型从哪里来：配置和注册表
+
+<SrcCode path="models/register.py" sym="_MODEL_REGISTRY" />
+
+`create_model` 拿 HF config 里 `architectures[0]` 查这张表，按需 `import` 对应模块，再用 `ModelConfig` 构造模型类。表里有 6 个架构名，对应 5 个模块，其中 `Mistral3ForConditionalGeneration` 也映射到 `mistral` 的文本模型。想加一个新模型，就是新写一个模块、在这里登记一行。
+
+`ModelConfig` 由 <Src path="models/config.py" sym="ModelConfig.from_hf" /> 从 HF 的 `PretrainedConfig` 里挑字段。Qwen3-0.6B 的 `config.json` 里与本章有关的值如下：
+
+| `ModelConfig` 字段 | 来自 HF config 的 | Qwen3-0.6B |
+| --- | --- | --- |
+| `num_layers` | `num_hidden_layers` | 28 |
+| `hidden_size` | `hidden_size` | 1,024 |
+| `num_qo_heads` | `num_attention_heads` | 16 |
+| `num_kv_heads` | `num_key_value_heads` | 8 |
+| `head_dim` | `head_dim` | 128 |
+| `intermediate_size` | `intermediate_size` | 3,072 |
+| `vocab_size` | `vocab_size` | 151,936 |
+| `rotary_config.max_position` | `max_position_embeddings` | 40,960 |
+| `rotary_config.base` | `rope_theta` | 1,000,000 |
+| `tie_word_embeddings` | `tie_word_embeddings` | true |
+
+注意 `head_dim` 这一行：16 个 head × 128 维 = 2,048，比 `hidden_size` 的 1,024 还大。`from_hf` 先读 config 里显式写的 `head_dim`，没有时才用 `hidden_size // num_attention_heads`。如果对 Qwen3-0.6B 走了后一条路，会得到 64，整个 attention 的形状都会错。
+
+### `BaseOP`：不继承 `nn.Module` 的层
+
+<SrcCode path="layers/base.py" sym="BaseOP" />
+
+mini-sglang 的层都继承自己写的 `BaseOP`，而不是 `torch.nn.Module`。推理不需要反向传播、hook、`train()`/`eval()` 这些东西，`BaseOP` 只做两件事：
+
+- `state_dict` 遍历实例的 `__dict__`：遇到张量就以属性名为键收进来，遇到子 `BaseOP` 就带上前缀递归。键名因此完全由**属性名**决定，例如 `Qwen3ForCausalLM` 里的 `self.model.layers` 第 0 层的 `self_attn.qkv_proj.weight`，键名就是 `model.layers.0.self_attn.qkv_proj.weight`。`OPList` 用下标作为这一级的名字。
+- `load_state_dict` 同样遍历，从传进来的字典里 `pop` 出同名张量，检查形状和 dtype 都一致后，直接 `setattr` 替换掉原来的 meta 张量。遍历完字典里还有剩的键就报错，所以 checkpoint 多一个或少一个权重都会在启动时暴露。
+
+两个约定：下划线开头的属性一律跳过，所以 `_comm`、`_layer_id`、RoPE 的 `_cos_sin_cache` 都不算权重；`StateLessOP` 把这两个方法变成空操作，用于没有权重的层（`AttentionLayer`、`RotaryEmbedding`）。
+
+这里有一个很巧的细节：`RopeAttn` 创建了 `q_norm`、`k_norm`，又把**同一个对象**传给了 `AttentionLayer`。`AttentionLayer` 是 `StateLessOP`，不会去加载它们，权重只在 `self_attn.q_norm.weight` 这个键上加载一次；因为是同一个对象，`AttentionLayer` 里用到的也就是加载后的权重。
+
+### 权重加载：合并与改名
+
+<SrcCode path="models/weight.py" sym="_MERGE_GROUPS" />
+
+运行时的结构和 checkpoint 不完全一样：Q、K、V 三个投影合成一个 `qkv_proj`，gate 和 up 合成一个 `gate_up_proj`，这样一次矩阵乘法就能算完，少发射两个 kernel。<Src path="models/weight.py" sym="load_weight" /> 逐个张量读 safetensors：
+
+- 先由 `_shard_tensor` 取出本 rank 的那一份（单卡时就是完整的一份，<StageLink id="s9" /> 讲怎么切）。
+- 属于合并组的张量先放进 `merge_buf`，等同组的都到齐了，按 `("q", "k", "v")` 或 `("gate", "up")` 的**固定顺序**在第 0 维上 `torch.cat`，改名后再交出去。顺序很重要：前向时 `AttentionLayer` 就是按「先 q、再 k、最后 v」的宽度 `split` 的。
+- MoE 模型还会把每个专家的权重堆成一个张量，Qwen3-0.6B 用不到。
+- 读完所有文件后，`merge_buf` 必须是空的，否则说明 checkpoint 缺了某个投影。
+
+`lm_head.weight` 的去向要单独说。Qwen3-0.6B 的 `tie_word_embeddings` 为 true，LM head 和 embedding 共用一份权重。本地缓存的这份 safetensors 里仍然存着一个 `lm_head.weight`，它会被读进来，然后在 <Src path="layers/embedding.py" sym="ParallelLMHead.load_state_dict" /> 里被直接 `pop` 掉丢弃；`ParallelLMHead.state_dict` 在共享时也返回空，所以它不会出现在模型的键里。
+
+合并之后每层的权重形状（`F.linear` 的权重是 `[输出维度, 输入维度]`）：
+
+| 运行时的键 | 形状 | 来自 checkpoint 的 |
+| --- | --- | --- |
+| `self_attn.qkv_proj.weight` | `[4096, 1024]`，4,096 = (16 + 2 × 8) × 128 | `q_proj` `[2048, 1024]`、`k_proj` `[1024, 1024]`、`v_proj` `[1024, 1024]` |
+| `self_attn.q_norm.weight`、`self_attn.k_norm.weight` | `[128]` | 同名 |
+| `self_attn.o_proj.weight` | `[1024, 2048]` | 同名 |
+| `mlp.gate_up_proj.weight` | `[6144, 1024]` | `gate_proj`、`up_proj` 各 `[3072, 1024]` |
+| `mlp.down_proj.weight` | `[1024, 3072]` | 同名 |
+| `input_layernorm.weight`、`post_attention_layernorm.weight` | `[1024]` | 同名 |
+
+### 各层：线性、norm、激活
+
+<SrcCode path="layers/linear.py" sym="LinearQKVMerged" />
+
+所有线性层的前向都是一行 `F.linear(x, self.weight, self.bias)`，区别只在构造时算出的本地形状，以及 `LinearOProj`、`LinearRowParallel` 在多卡时多一次 all-reduce。单卡时 `tp_info.size` 是 1，它们都退化成普通的矩阵乘法。
+
+<SrcCode path="layers/norm.py" sym="RMSNormFused" />
+
+`RMSNormFused` 是理解 Qwen3 前向的关键。它有两种用法：
+
+- 不传 `residual`（只有第 0 层的 `input_layernorm` 会这样）：返回 `rmsnorm(x)`，并把原来的 `x` 当作 `residual` 交出去。
+- 传了 `residual`：调用 FlashInfer 的 `fused_add_rmsnorm`，**就地**做两件事：先 `residual += x`，再把 `x` 改写成 `rmsnorm(residual)`。一个 kernel 完成「加残差」和「归一化」。
+
+普通的 `RMSNorm` 只在 q/k norm 上用，`forward_inplace` 用 `out=x` 就地写回。激活函数 `silu_and_mul` 同样来自 FlashInfer：输入的前一半当 gate、后一半当 up，算 `silu(gate) * up`，输出宽度减半。
+
+### RoPE：预先算好的 cos/sin 表
+
+<SrcCode path="layers/rotary.py" sym="RotaryEmbedding.__init__" />
+
+`RotaryEmbedding` 在构造时就把所有位置的 cos、sin 算好，拼成一张 `[max_position, head_dim]` 的表：前 64 列是 cos，后 64 列是 sin（`inv_freq` 有 `head_dim / 2` 个频率）。对 Qwen3-0.6B 这张表是 `[40960, 128]` 的 float32，约 20 MiB。前向时 `apply_rope_with_cos_sin_cache_inplace` 按每个 token 的 `positions` 查表，就地改写 q 和 k。这个 FlashInfer 函数要求表必须是 float32，所以代码里显式写了 `dtype=torch.float`，不受 `torch_dtype` 设的默认 dtype 影响；它的 `is_neox` 默认为 True，也就是把 head 维度分成前后两半来旋转。
+
+这张表要的是真实数值，不能留在 meta device 上，这就是 `set_rope_device` 的用处：
+
+<SrcCode path="layers/rotary.py" sym="get_rope" />
+
+`get_rope` 发现当前默认设备是 meta 时，就切到之前记下的真实设备上再构造。它还带着 `functools.cache`：28 层的参数完全一样，拿到的是**同一个** `RotaryEmbedding` 对象，这张表只存一份。`rope_scaling` 要转成元组才能当缓存的键，这就是 `AttentionLayer` 里 `tuple(rotary_config.scaling.items())` 的原因。
+
+### Attention 层：切开、归一化、旋转、交给后端
+
+<SrcCode path="layers/attention.py" sym="AttentionLayer.forward" />
+
+输入是 `qkv_proj` 的输出 `[T, 4096]`（`T` 是这一批所有请求的 token 数加起来）。按宽度 `split` 成 q `[T, 2048]`、k `[T, 1024]`、v `[T, 1024]`，这三个都是原张量的视图，不拷贝数据。
+
+- q/k norm 先把视图 `view` 成 `[T, 16, 128]` 和 `[T, 8, 128]`，在每个 head 的 128 维上做 RMSNorm，就地写回。这是 Qwen3 相对 Qwen2 多出来的一步（`RopeAttn` 的 `has_qk_norm=True`）。
+- RoPE 同样就地改写 q 和 k，位置来自 `ctx.batch.positions`（<StageLink id="s5" /> 讲它怎么拼出来）。
+- q 变成 `[T, 16, 128]`，k、v 保持二维，一起交给 `ctx.attn_backend.forward`。后端先把这一批新算出的 k、v 写进 KV 池（<StageLink id="s4" />），再读出每个请求的全部历史做 attention（<StageLink id="s7" />）。
+- 输出 `[T, 16, 128]` 展平回 `[T, 2048]`。
+
+attention 层的代码不知道这一批是 prefill 还是 decode、每个请求的历史有多长：这些都藏在 `batch` 的 metadata 里，由后端去处理。整个模型里只有 LM head 会看 `is_prefill`，决定只取每个请求最后一个位置的 hidden state。16 个 query head 共用 8 组 K/V（GQA），也是后端的事。
+
+### 一个 decoder 层的完整前向
+
+<SrcCode path="models/qwen3.py" sym="Qwen3DecoderLayer.forward" />
+
+<SrcCode path="models/qwen3.py" sym="Qwen3Model.forward" />
+
+读这段代码要同时跟踪两条线：`x` 是「这一步子模块的输出」，`residual` 是「到目前为止的残差流」。每个子模块的输出并不马上加回残差，而是留给**下一个** norm 用 `fused_add_rmsnorm` 加。所以第 i 层返回的 `(x, residual)` 里，`x` 是 MLP 的输出、`residual` 是进 MLP 之前的残差流，这一层真正的输出隐藏状态是两者之和 `x + residual`。最后的 `self.norm` 也是一个 `RMSNormFused`，负责加上最后一层的 MLP 输出。
+
+Qwen3-0.6B 一个 decoder 层里每一步的形状如下。`T` 是这一批的 token 数：prefill 时是所有请求这次要算的 prompt 长度之和，decode 时每个请求 1 个（用 CUDA graph 时还包括补齐用的 dummy 请求，<StageLink id="s7" />）。
+
+| 步骤 | 代码 | 输出形状 |
+| --- | --- | --- |
+| 输入 | `batch.input_ids` | `[T]`，int32 |
+| embedding（只在第 0 层之前） | `embed_tokens` | `[T, 1024]` |
+| 前置 norm | `input_layernorm` | `x`、`residual` 都是 `[T, 1024]` |
+| 合并投影 | `qkv_proj` | `[T, 4096]` |
+| 切开 | `split` | q `[T, 2048]`，k `[T, 1024]`，v `[T, 1024]` |
+| q/k norm | `q_norm`、`k_norm` | 就地，按 `[T, 16, 128]`、`[T, 8, 128]` 看 |
+| RoPE | `rotary` | 就地，形状不变 |
+| attention | `attn_backend.forward` | `[T, 16, 128]`，展平为 `[T, 2048]` |
+| 输出投影 | `o_proj` | `[T, 1024]` |
+| 加残差、norm | `post_attention_layernorm` | `x`、`residual` 都是 `[T, 1024]` |
+| gate 和 up | `gate_up_proj` | `[T, 6144]` |
+| 激活 | `silu_and_mul` | `[T, 3072]` |
+| 下投影 | `down_proj` | `[T, 1024]` |
+
+<Mermaid
+  caption="一个 Qwen3 decoder 层里的两条线：子模块的输出 x 并不马上加回残差，而是交给下一个 RMSNormFused 一起做。"
+  code={`flowchart TD
+    IN["上一层的 x 和 residual"] --> N1["input_layernorm：residual += x，x = norm(residual)"]
+    N1 --> QKV["qkv_proj：[T, 4096]"]
+    QKV --> SPLIT["split 成 q、k、v"]
+    SPLIT --> QK["q_norm、k_norm、RoPE（就地）"]
+    QK --> ATT["attention 后端：先写 KV，再算 attention"]
+    ATT --> O["o_proj：[T, 1024]"]
+    O --> N2["post_attention_layernorm：residual += x，x = norm(residual)"]
+    N2 --> MLP["gate_up_proj、silu_and_mul、down_proj"]
+    MLP --> OUT["返回 x（MLP 输出）和 residual"]`}
+/>
+
+### 最后一步：LM head
+
+<SrcCode path="layers/embedding.py" sym="ParallelLMHead.forward" />
+
+embedding 用的是 JIT 编译的 `indexing` kernel 按 token id 取行（<StageLink id="s10" />），LM head 则是一次 `F.linear`。两者在 Qwen3-0.6B 上共用 `[151936, 1024]` 这一份权重：`module = self.tied_embedding or self` 选的就是 embedding。
+
+prefill 时，一个请求只有最后一个位置的 logits 有用，`get_last_indices` 从 attention metadata 里的累积长度算出每个请求最后一个 token 在这一批里的下标，先挑出 `[B, 1024]`（`B` 是请求数）再乘，得到 `[B, 151936]`。不这样做，一个 8,000 token 的 prompt 就要白白算 8,000 行、每行 15 万维的 logits。decode 时每个请求本来就只有 1 个 token，不用挑。多卡时每张卡只算自己那一段词表，再 all-gather 拼起来（<StageLink id="s9" />）。
+
+### 和 HF transformers 对照
+
+以 transformers 4.57.3 的 `models/qwen3/modeling_qwen3.py` 为准，能从两边代码里确认的对应关系如下：
+
+| mini-sglang | HF transformers | 关系 |
+| --- | --- | --- |
+| `Qwen3ForCausalLM`、`Qwen3Model`、`Qwen3DecoderLayer`，属性名 `model`、`layers`、`self_attn`、`mlp`、`input_layernorm`、`post_attention_layernorm`、`norm`、`lm_head` | 同名的类和属性 | 结构一一对应，所以除了被合并的投影，checkpoint 的键名可以直接用 |
+| `qkv_proj` 一次算完，再 `split` | `q_proj`、`k_proj`、`v_proj` 分三次算 | 权重按 q、k、v 顺序拼接，结果相同 |
+| `gate_up_proj` 加 `silu_and_mul` | `down_proj(act_fn(gate_proj(x)) * up_proj(x))` | 相同的算式 |
+| q/k norm 在 `[T, heads, 128]` 的视图上就地做，然后 RoPE | `q_norm(q_proj(x).view(hidden_shape))`，然后 `apply_rotary_pos_emb` | 都是先按 head 维 norm，再旋转 |
+| RoPE 查预先算好的 float32 表，FlashInfer 默认的 neox 风格 | `rotate_half` 把最后一维分成前后两半 | 同一种旋转方式 |
+| 残差留给下一个 `fused_add_rmsnorm` 加 | 层内 `residual + hidden_states` 加两次 | 数学上等价；第 i 层的输出对应 `x + residual` |
+| 共享权重时 LM head 直接用 embedding 的权重 | `_tied_weights_keys = ["lm_head.weight"]` | 共用同一份权重 |
+| prefill 只算每个请求最后一个位置的 logits | 默认 `logits_to_keep=0`，算所有位置 | 对照时取 HF 的最后一个位置 |
+| attention 从分页的 KV 池里读历史 | 用 `past_key_values` 的 `Cache` 对象 | 实现完全不同，见 <StageLink id="s4" /> 和 <StageLink id="s7" /> |
+
+「数学上等价」不等于「逐位相同」。两边的 norm、RoPE、attention 用的是不同的 kernel，bfloat16 下的舍入顺序可能不同；残差相加放在哪个 kernel 里做、用什么精度累加，也可能不同。差多少、差在哪一层，要自己测，见动手实验第 3 步。
+
+## 常见误区
+
+- **「`head_dim` 总是等于 `hidden_size / num_attention_heads`」**：Qwen3-0.6B 就不是，128 × 16 = 2,048 大于 1,024。所以 `o_proj` 的输入维度写的是 `head_dim * num_qo_heads`，而不是 `hidden_size`。
+- **「每个 decoder 层返回的就是这一层的输出」**：返回的是 MLP 输出 `x` 和还没加上它的残差流 `residual`，真正的层输出是两者之和。
+- **「在 meta device 上构造模型之后，还要再 `.to('cuda')`」**：不用。`load_state_dict` 直接用加载好的 GPU 张量替换掉 meta 张量；RoPE 表本来就建在真实设备上。
+- **「mini-sglang 的层是 `nn.Module`，可以用 `register_forward_hook`」**：不是。`BaseOP` 没有 hook 机制，想观察中间结果要直接改 `forward` 或替换方法，见动手实验。
+- **「prefill 时 LM head 对所有位置都算 logits」**：只对每个请求的最后一个位置算。
+
+## 自测题
+
+1. 为什么要在 `meta` device 上构造模型？RoPE 为什么要单独处理？
+
+   <Answer>
+   meta 张量只有形状和 dtype，不占显存也不初始化，先把结构搭出来，加载时再整体换成真实权重，省掉一份无用的分配和随机初始化。RoPE 的 cos/sin 表是构造时就要算出真实数值的缓冲区，不从 checkpoint 加载，留在 meta 上就没有值了，所以 `get_rope` 检测到默认设备是 meta 时，切到 `set_rope_device` 记下的设备上去建。
+   </Answer>
+
+2. `BaseOP.load_state_dict` 怎么保证 checkpoint 和模型结构对得上？
+
+   <Answer>
+   按属性名拼出键，逐个从字典里 `pop`，找不到会 `KeyError`；找到了要检查形状和 dtype 完全一致；遍历完如果字典里还有剩的键，抛 `Unexpected keys`。多、少、形状不对都会在启动时报错。
+   </Answer>
+
+3. Qwen3-0.6B 的 `qkv_proj.weight` 是什么形状？前向时 `split` 的三段宽度各是多少？如果合并时顺序写成了 k、q、v 会怎样？
+
+   <Answer>
+   `[4096, 1024]`，4,096 = (16 + 2 × 8) × 128。`split` 成 2,048、1,024、1,024。合并顺序和 `split` 的顺序必须一致，写反了不会报错：拼出来的总宽度不变，形状检查照样通过。但 `split` 切出来的「q」其实是 k 的权重加上一半 q 的权重，算的已经不是原来的模型了。
+   </Answer>
+
+4. `lm_head.weight` 在加载过程中经历了什么？
+
+   <Answer>
+   `load_weight` 会把它从 safetensors 读上 GPU，放进 `_load_weight_state_dict` 返回的字典。Qwen3-0.6B 的权重是共享的，`ParallelLMHead.load_state_dict` 发现有 `tied_embedding`，直接把 `lm_head.weight` 和可能存在的 `lm_head.bias` 从字典里删掉，前向时用 embedding 的权重。
+   </Answer>
+
+5. 第 0 层和第 1 层调用 `input_layernorm` 时有什么不同？
+
+   <Answer>
+   第 0 层传进来的 `residual` 是 None：做普通的 `rmsnorm(x)`，并把 embedding 输出本身当作 `residual` 返回。之后各层传进来的是上一层的 MLP 输出 `x` 和残差流 `residual`：`fused_add_rmsnorm` 先 `residual += x`，把上一层的 MLP 输出加进残差流，再把 `x` 改写成归一化的结果。
+   </Answer>
+
+6. 为什么 LM head 在 prefill 时要先挑出每个请求的最后一个位置？decode 时为什么不用？
+
+   <Answer>
+   只有最后一个位置的 logits 用来采样下一个 token，其他位置算了也是白算，而词表有 151,936 维，一个长 prompt 全算一遍很浪费。decode 时每个请求本来就只有 1 个输入 token，这一批的行数就是请求数（用 CUDA graph 时多出的 dummy 行由引擎切掉）。
+   </Answer>
+
+7. 进阶：用 HF 的 `register_forward_hook` 拿到第 i 层的输出，要和 mini-sglang 里哪个量比？记录它时要注意什么？
+
+   <Answer>
+   HF 第 i 层的输出是加完两次残差的隐藏状态，对应 mini-sglang 第 i 层返回的 `x + residual`。要注意 `x` 和 `residual` 都会被下一层的 `fused_add_rmsnorm` 就地改写，所以必须在这一层返回时立刻算出一个新张量（`x + residual` 本身就会新建张量）保存下来，不能只存引用。另外 HF 的张量带 batch 维 `[1, T, 1024]`，mini-sglang 是 `[T, 1024]`。
+   </Answer>
+
+## 动手实验
+
+<Steps>
+
+1. **核对形状表。** 在 `Qwen3DecoderLayer.forward` 和 `AttentionLayer.forward` 里打印每一步的 `shape`，只在第 0 层打印（`Qwen3DecoderLayer` 里判断 `self._layer_id == 0`，`AttentionLayer` 里是 `self.layer_id == 0`），用 <StageLink id="s1" /> 的最小配置跑一个 prompt。先用最小配置里的 `cuda_graph_max_bs=8` 跑一次，再改成 `cuda_graph_max_bs=0` 跑一次。观察：开着 CUDA graph 时，decode 阶段的打印只出现在启动录图的时候，之后生成 token 时不再出现。想一想为什么（<StageLink id="s7" />）。
+
+2. **看权重的键怎么变。** 不用 GPU，直接读 safetensors 的键名，再和模型的键名对比：
+
+   ```python
+   import glob
+   import safetensors
+   from minisgl.utils import download_hf_weight
+
+   folder = download_hf_weight("Qwen/Qwen3-0.6B")
+   for file in glob.glob(f"{folder}/*.safetensors"):
+       with safetensors.safe_open(file, framework="pt") as f:
+           for name in sorted(f.keys()):
+               if "layers.0." in name or "layers" not in name:
+                   print(name, f.get_slice(name).get_shape())
+   ```
+
+   对照上面的形状表，找出哪些键在运行时被合并、哪一个被丢弃。创建 `LLM` 之后，再打印 `sorted(llm.engine.model.state_dict())` 的前几个键核对一遍。
+
+3. **逐层对上 HF transformers。** 下面的脚本在 prefill 时记下 mini-sglang 每一层的输出和 logits，再用 HF 算同一个 prompt，逐层比较最大绝对误差：
+
+   ```python title="compare_hf.py"
+   import torch
+   from transformers import AutoModelForCausalLM
+
+   from minisgl.core import SamplingParams, get_global_ctx
+   from minisgl.layers import ParallelLMHead
+   from minisgl.llm import LLM
+   from minisgl.models.qwen3 import Qwen3DecoderLayer
+
+   llm = LLM(
+       "Qwen/Qwen3-0.6B",
+       attention_backend="fi",
+       max_seq_len_override=4096,
+       cuda_graph_max_bs=8,
+       memory_ratio=0.5,
+   )
+
+   ours, ours_logits = [], []
+   layer_forward = Qwen3DecoderLayer.forward
+   head_forward = ParallelLMHead.forward
+
+   def record_layer(self, x, residual=None):
+       x, residual = layer_forward(self, x, residual)
+       if get_global_ctx().batch.is_prefill:
+           ours.append((x + residual).float())  # 新建张量，下一层的就地修改不会影响它
+       return x, residual
+
+   def record_head(self, x):
+       logits = head_forward(self, x)
+       if get_global_ctx().batch.is_prefill:
+           ours_logits.append(logits.float())
+       return logits
+
+   Qwen3DecoderLayer.forward = record_layer
+   ParallelLMHead.forward = record_head
+
+   ids = llm.tokenizer.encode("The capital of France is")
+   llm.generate([ids], SamplingParams(max_tokens=1))
+
+   hf = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B", torch_dtype=torch.bfloat16).cuda()
+   theirs = []
+   for layer in hf.model.layers:
+       layer.register_forward_hook(
+           lambda m, args, out: theirs.append((out[0] if isinstance(out, tuple) else out).float())
+       )
+   with torch.inference_mode():
+       hf_logits = hf(torch.tensor([ids], device="cuda")).logits[0, -1].float()
+       for i, (a, b) in enumerate(zip(ours, theirs)):
+           print(f"layer {i:2d}: max abs diff = {(a - b[0]).abs().max().item():.4f}")
+       a = ours_logits[0][0]
+       print("logits max abs diff:", (a - hf_logits).abs().max().item())
+       print("argmax:", a.argmax().item(), hf_logits.argmax().item())
+   llm.shutdown()
+   ```
+
+   先预测，再运行：每一层的输出会逐位相等吗？如果不等，差距随层数怎么变化？最后两边的 argmax 是否一致？然后把 `Qwen3DecoderLayer.forward` 里的残差写法改成 HF 那样「层内加两次」（不再用 `fused_add_rmsnorm`，改用普通的 `rmsnorm` 和显式的加法），重跑一次，看差距有没有变化，据此判断误差的主要来源。
+
+4. **故意弄坏它。** 在 `models/weight.py` 的 `_MERGE_GROUPS` 里把 `("q", "k", "v")` 改成 `("k", "q", "v")`（`.q_proj`、`.k_proj`、`.v_proj` 三行都要改），重新生成一句话。启动会报错吗？输出会变成什么样？这说明 `load_state_dict` 的检查能防住什么、防不住什么。实验完记得改回来。
+
+</Steps>
+
+## 过关标准
+
+- 能不看代码写出 Qwen3-0.6B 一个 decoder 层前向时每一步的张量形状，并说清 `x` 和 `residual` 各是什么。
+- 能说出 checkpoint 的哪些权重在加载时被合并、按什么顺序合并、`lm_head.weight` 为什么被丢弃。
+- 能对照 HF transformers 的 `Qwen3DecoderLayer`，指出 mini-sglang 哪里写法不同但数学上等价，以及逐层比较时应该拿哪两个量来比。

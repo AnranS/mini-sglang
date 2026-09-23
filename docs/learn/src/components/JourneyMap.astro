@@ -1,0 +1,8 @@
+---
+import Journey from './react/Journey';
+import { DECODE_LOOP, LANES, STEPS } from '../data/journey.mjs';
+import { describeRef } from '../lib/source.mjs';
+
+const steps = STEPS.map((step) => ({ ...step, refs: step.refs.map(describeRef) }));
+---
+<Journey client:visible lanes={LANES} steps={steps} loop={DECODE_LOOP} />

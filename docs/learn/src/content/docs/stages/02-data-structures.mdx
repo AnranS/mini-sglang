@@ -1,0 +1,296 @@
+---
+title: 核心数据结构
+description: Req 的三个长度、Batch、全局 Context，以及调度器维护的两张二维表。
+sidebar:
+  order: 2
+  label: 2 · 核心数据结构
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import Answer from '~/components/Answer.astro';
+import FileTable from '~/components/FileTable.astro';
+import Src from '~/components/Src.astro';
+import SrcCode from '~/components/SrcCode.astro';
+import StageHeader from '~/components/StageHeader.astro';
+import StageLink from '~/components/StageLink.astro';
+
+<StageHeader id="s2" />
+
+## 这一阶段要搞懂什么
+
+后面每一章读的代码，都在读写同几样东西：一个请求的状态 `Req`，一批请求 `Batch`，模型各层共用的全局 `Context`，以及 GPU 上的两张二维表 `page_table` 和 `token_pool`。这几样东西加起来不到 200 行，但几乎每一行都有讲究。先把它们吃透，读调度器和模型时才不会被长度差 1、行号对不上这类问题绊住。读完这一章，你应该能回答：
+
+- `Req` 的三个长度是哪三个？每一步前向前后各是多少？
+- `complete_one` 和 `append_host` 为什么要分成两个方法？
+- 一个 batch 的输入为什么是一维拼接的，模型怎么知道哪个 token 属于哪个请求？
+- `model.forward()` 为什么一个参数都没有？
+- `page_table` 和 `token_pool` 各有几行几列，最后一行是干什么的？
+
+## 精读清单
+
+<FileTable files={[
+  { path: 'core.py', sym: 'SamplingParams', note: '哪些组合算贪心；`max_tokens` 的默认值' },
+  { path: 'scheduler/utils.py', sym: 'PendingReq', note: '还没分到资源的请求长什么样' },
+  { path: 'core.py', sym: 'Req', note: '三个长度，以及由它们算出来的 `extend_len`、`remain_len`、`can_decode`' },
+  { path: 'scheduler/prefill.py', sym: 'ChunkedReq', note: '只改了两处，各防什么' },
+  { path: 'core.py', sym: 'Batch', note: '哪些字段由调度器填，哪些由 attention 后端填' },
+  { path: 'core.py', sym: 'Context', note: '`forward_batch` 为什么不允许嵌套' },
+  { path: 'scheduler/table.py', sym: 'TableManager', note: '空闲行怎么分配；`token_pool` 为什么要初始化成 0' },
+  { path: 'engine/engine.py', sym: 'Engine.__init__', note: '只看 page table 和 dummy 请求那两段' },
+]} />
+
+## 讲解
+
+### 采样参数：`SamplingParams`
+
+<SrcCode path="core.py" sym="SamplingParams" />
+
+- 默认 `temperature=0.0`，也就是贪心解码：每一步取概率最大的 token。`top_k=1` 也算贪心，但只要 `top_p` 小于 1 就不算。
+- `top_k=-1` 表示不限制。采样器（<Src path="engine/sample.py" sym="Sampler.prepare" />）把它换成词表大小；一批里所有请求都是贪心时，直接 `argmax`，不走采样 kernel。
+- `max_tokens` 默认 1,024。它不只是上限：调度器按它给每个请求预留 KV 空间，设得越大，能同时接纳的请求越少（<StageLink id="s5" />）。请求进门时，如果 prompt 长度加上 `max_tokens` 超过 `max_seq_len`，`max_tokens` 会被原地截短。
+- `ignore_eos=True` 时采到 EOS 也不停，一直生成到 `max_tokens`。benchmark 用它来保证输出长度固定。
+
+### 等待中的请求：`PendingReq`
+
+新请求先进入 prefill 的等待队列，这时它还只是一个 <Src path="scheduler/utils.py" sym="PendingReq" />：`uid`、完整的 `input_ids` 和采样参数，外加一个 `chunked_req`，记录分块 prefill 时上一块的进度。它的 `output_len` 直接读 `sampling_params.max_tokens`。
+
+它还没有占用任何资源。只有通过了准入检查（<StageLink id="s5" />），调度器才给它分配一行表、锁住命中的前缀，然后创建真正的 `Req`。
+
+### 一个请求的状态：`Req` 和它的三个长度
+
+<SrcCode path="core.py" sym="Req" mark={['self.device_len = len(self.input_ids)', 'self.max_device_len = len(self.input_ids) + self.output_len']} />
+
+构造时传进来的字段：
+
+- `input_ids`：CPU 上的 token 序列，开始是 prompt，之后每收到一个输出 token 就追加一个。
+- `table_idx`：这个请求在 `page_table` 和 `token_pool` 里占的**行号**。它和 `uid` 是两回事：`uid` 是对外的请求编号，服务模式下一直递增（离线的 `LLM.generate` 每次调用都从 0 重新编号）；`table_idx` 是资源，请求结束就还回去，下一个请求接着用。
+- `output_len`：就是 `max_tokens`。
+- `cache_handle`：前缀缓存的句柄，记录这个请求锁住了缓存里的哪段前缀（<StageLink id="s6" />）。
+
+三个长度，都是从序列开头数起的 token 数：
+
+| 长度 | 含义 |
+| --- | --- |
+| `cached_len` | 前面这么多个 token 的 K/V 已经算过（或者已经安排算了） |
+| `device_len` | GPU 上这个请求的序列有多长，也就是本轮输入到哪里为止 |
+| `max_device_len` | 序列最长能到多少：prompt 长度加 `max_tokens`，创建时定下，之后不变 |
+
+由它们算出来的三个属性：
+
+- `extend_len = device_len - cached_len`：这一轮要送进模型的 token 数。prefill 时是还没算过的 prompt 长度，decode 时是 1。
+- `remain_len = max_device_len - device_len`：还能再生成几个 token。
+- `can_decode`：`remain_len > 0`，也就是还没到 `max_tokens`。
+
+构造函数里的断言 `0 <= cached_len < device_len <= max_device_len` 值得停下来想一想：`cached_len` 连等于 `device_len` 都不行。每一轮至少要送进 1 个 token，否则拿不到预测下一个 token 的 logits。这也是为什么前缀缓存匹配时只用 `input_ids[:-1]`：就算整个 prompt 都在缓存里，最后一个 token 也要重算（<StageLink id="s6" />）。
+
+### 推一遍：4 个 token 的 prompt，`max_tokens=3`
+
+长度字段怎么变，只由两个方法决定：
+
+- `complete_one`：`cached_len` 设成 `device_len`，`device_len` 加 1。它在 <Src path="engine/engine.py" sym="Engine.forward_batch" /> 里，**发射完**模型前向之后立刻调用。意思是「这一轮的输入都会算出 K/V，并且会多出一个新 token」。
+- `append_host`：把采样出的 token 追加到 CPU 上的 `input_ids`。它在 <Src path="scheduler/scheduler.py" sym="Scheduler._process_last_data" /> 里，等 token 拷回 CPU 之后调用。
+
+假设 prompt 是 4 个 token，没有命中前缀缓存，`max_tokens=3`，中途没有采到 EOS，关掉 overlap（`normal_loop`）。创建时 `cached_len=0`、`device_len=4`、`max_device_len=7`。每一轮：
+
+| 轮次 | 发射前 `cached_len` / `device_len` | 本轮输入的位置 | 采样结果写进 `token_pool` 的列 | `complete_one` 后 | 收尾后 `len(input_ids)` | `remain_len` | 结果 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1（prefill） | 0 / 4 | 0、1、2、3 | 4 | 4 / 5 | 5 | 2 | 输出 y0，进入 decode |
+| 2（decode） | 4 / 5 | 4 | 5 | 5 / 6 | 6 | 1 | 输出 y1 |
+| 3（decode） | 5 / 6 | 5 | 6 | 6 / 7 | 7 | 0 | 输出 y2，结束 |
+
+逐列对照代码：
+
+- **本轮输入的位置**是 `arange(cached_len, device_len)`，由 `_make_positions` 算出。这也是这一轮要分配 KV 槽位的区间 `[cached_len, device_len)`（`allocate_paged`，<StageLink id="s4" />）。
+- **写进哪一列**：`_make_write_tuple` 用的是发射前的 `device_len`，条件是 `can_decode`。第 3 轮发射时 `remain_len` 还是 1，所以照样写第 6 列。
+- 第 2 轮输入的 y0 从哪来？不是从 CPU 的 `input_ids`，而是 GPU 从 `token_pool` 第 4 列读出来的，第 1 轮的采样结果刚写在那里。
+- **结束**：第 3 轮 `complete_one` 之后 `device_len` 等于 `max_device_len`，`can_decode` 变成 False。`_forward` 末尾的 `filter_reqs` 把它移出 decode 集合，收尾时 `finished = not req.can_decode` 为真，释放资源。
+
+三个输出 token，一个来自 prefill、两个来自 decode。结束时 `input_ids` 有 7 个 token，但只有前 6 个的 K/V 算过：y2 只被采样出来，从没作为输入送进模型。所以交给前缀缓存的是 `input_ids[:cached_len]`，也就是前 6 个。<StageLink id="s6" /> 的实测里，第一次生成之后前缀缓存的 `evictable` 是 20，也就是 prompt 的 5 个 token 加 16 个输出再减 1，原因就在这里。
+
+还有一个对得上的地方：`page_size` 为 1 时，`remain_len` 恰好等于这个请求还需要分配的 KV 槽位数。第 1 轮之后是 2，之后两轮 decode 各分配 1 个。调度器预留空间时加总的 `inflight_tokens` 用的就是它。
+
+<Aside type="note" title="开着 overlap 时，顺序会错开一拍">
+overlap 模式下，第 N 批的收尾排在第 N+1 批发射**之后**（<StageLink id="s5" />）。所以收尾时看到的 `device_len` 已经被下一批的 `complete_one` 又推进了一格，`len(input_ids)` 比 `device_len` 少 1。上面的例子里，第 2 批的收尾发生在第 3 批发射之后，这时 `can_decode` 已经是 False，`finished` 在处理 y1 时就为真；第 3 批的结果 y2 到来时，请求已经在 `finished_reqs` 里，不会再释放一次。离线的 `LLM` 仍然会把 y1、y2 都放进输出；服务模式就不一样了，API server 读到 y1 上的结束标志就结束响应，y2 到不了客户端（<StageLink id="s5" hash="结束的请求还留下了两个问题" />）。
+</Aside>
+
+**为什么分成两个方法？** 调度下一批只需要知道长度，不需要知道内容：下一批的输入 token 由 GPU 从 `token_pool` 里读。`complete_one` 在发射时就推进长度，调度器马上可以安排下一批；`append_host` 要等 token 拷回 CPU，放在收尾时做。两者分开，CPU 才能领先 GPU 一拍。
+
+### 分块 prefill 的请求：`ChunkedReq`
+
+<SrcCode path="scheduler/prefill.py" sym="ChunkedReq" />
+
+prompt 太长、一批算不完时，前面几块用 `ChunkedReq` 表示。它只改了两处：
+
+- `can_decode` 恒为 False。所以 `filter_reqs` 不会把它放进 decode 集合，`_make_write_tuple` 给它写 -1（丢弃采样结果）。收尾时跳过它靠的是另一个判断：`_process_last_data` 按类型检查，遇到 `ChunkedReq` 直接跳过。
+- `append_host` 直接抛异常。只算了一部分 prompt，最后一个位置的 logits 预测的并不是真正的下一个 token，采样出来也没用。
+
+每一块都是一个**新的** `ChunkedReq` 对象，`input_ids` 只截到这一块的末尾，`table_idx` 和 `cache_handle` 沿用上一块的。接着切哪里，看的是上一块 `complete_one` 之后的 `cached_len`；上一块的 `device_len` 被多加了 1，但没有人再用它。实测记录里 100 个 token 的 prompt、预算 16 时，前 6 块是 `ChunkedReq`，`cached_len` 依次是 0、16、32……80，第 7 块只剩 4 个 token，变成普通的 `Req`，这一块才采样。
+
+### 一批请求：`Batch`
+
+<SrcCode path="core.py" sym="Batch" />
+
+- `phase` 是 `"prefill"` 或 `"decode"`，一个 batch 不会混着两种。
+- `reqs` 是真实的请求；`padded_reqs` 是 CUDA graph 补齐之后的列表，末尾可能多出几个 dummy 请求。`size` 和 `padded_size` 分别是两者的长度。
+- `input_ids`、`positions`、`out_loc`、`padded_reqs` 都是 `init=False`，由调度器在 `_prepare_batch` 和 `_forward` 里填；`attn_metadata` 由 attention 后端的 `prepare_metadata` 填（<StageLink id="s7" />）。
+
+输入不是 `[batch, 最大长度]` 的二维张量，而是把每个请求这一轮的输入**拼成一维**，不做填充。比如一个 prefill 批里有两个请求：
+
+```text
+A：table_idx=2，cached_len=3，device_len=5，本轮输入位置 3、4
+B：table_idx=0，cached_len=0，device_len=2，本轮输入位置 0、1
+
+positions  = [3, 4, 0, 1]                  _make_positions
+行号       = [2, 2, 0, 0]                  _make_input_tuple
+input_ids  = token_pool[行号, positions]   _forward
+out_loc    = page_table[行号, positions]   _prepare_batch，本轮新 K/V 写到哪
+```
+
+哪几个 token 属于同一个请求、每个请求的历史 K/V 有多长，由 `attn_metadata` 告诉 attention kernel，请求之间不会互相 attend。LM head 在 prefill 时只取每个请求的最后一个位置，这里是下标 1 和 3（从 0 数），得到两行 logits。
+
+decode 批也是这样拼的，只是每个请求只有 1 个 token。如果 decode 批有 3 个请求、录过的 graph 大小是 1、2、4、8，`pad_batch` 会补 1 个 dummy 请求凑成 4 个，dummy 的那一个位置读 `token_pool` 最后一行、写 `page_table` 最后一行指向的哑页。采样和写回只看 `reqs`，不看 dummy。
+
+### 全局 `Context`
+
+<SrcCode path="core.py" sym="Context" />
+
+`Context` 装着模型前向时各层都要用的东西：`page_size`、`page_table`、KV 池、attention 后端、MoE 后端，以及当前正在算的 batch。引擎初始化时创建它，用 `set_global_ctx` 设成进程里唯一的一份，各层用 `get_global_ctx()` 取：
+
+- 模型入口从 `ctx.batch.input_ids` 取输入（<Src path="models/qwen3.py" sym="Qwen3ForCausalLM.forward" />）。
+- attention 层从 `ctx.batch.positions` 取位置做 RoPE，再调用 `ctx.attn_backend.forward`（<Src path="layers/attention.py" sym="AttentionLayer.forward" />）。
+- LM head 看 `ctx.batch.is_prefill` 决定要不要只取最后一个位置。
+
+所以 `model.forward()` 一个参数都没有。好处有两个：各层之间不用一层层传参；更重要的是录 CUDA graph 时，只要把 batch 的 `input_ids`、`positions`、`out_loc` 指向固定的 buffer，模型代码一行都不用改（<StageLink id="s7" />）。
+
+`forward_batch` 是一个上下文管理器，进入时设置当前 batch，退出时清空，并断言没有嵌套：同一时刻只能有一个 batch 在前向。代价是全局状态：`set_global_ctx` 只能调用一次，一个进程里只能有一个引擎，这也是 <StageLink id="s1" /> 说一个进程只能创建一个 `LLM` 的原因之一。
+
+### 两张二维表：`page_table` 和 `token_pool`
+
+<SrcCode path="scheduler/table.py" sym="TableManager" />
+
+`page_table` 由引擎创建、放进 `Context`；`token_pool` 是 `TableManager` 照着它的形状建的，类型是 `int32`，初始全 0。两张表形状相同，同一行属于同一个请求，同一列是同一个位置：
+
+- `token_pool[i, j]`：第 i 行的请求在位置 j 的 **token id**。模型的输入永远从这里读。
+- `page_table[i, j]`：这个 token 的 K/V 存在 KV 池的**哪个位置**。注意存的是 token 级的物理位置，不是页号；`Context` 的注释写着这张表「always treat page_size = 1」，`page_size` 大于 1 时，分配器会把一页展开成连续的几个位置再写进来（<StageLink id="s4" />）。
+
+形状在引擎里定：
+
+<SrcCode path="engine/engine.py" sym="Engine.__init__" from="# ======================= Page table initialization" to="device=self.device," />
+
+- 行数是 `max_running_req + 1`，最后一行留给 dummy 请求。
+- 列数是 `max_seq_len` 向上对齐到 32 的倍数，`max_seq_len` 取模型的最大上下文长度（设了 `max_seq_len_override` 时用它）和 KV 池 token 数中较小的那个。注释说对齐是为了让每一行按 128 字节对齐（32 个 `int32`）。
+
+<Aside type="note" title="实测：默认配置下是 [257, 40960]">
+在 RTX 4080 SUPER 上用默认配置启动，`page_table` 和 `token_pool` 都是 `[257, 40960]`：257 是默认的 `max_running_req` 256 加 1 行 dummy；40,960 是 Qwen3-0.6B 的最大上下文长度，比 KV 池的 112,081 个 token 小，本身就是 32 的倍数。按同样的规则，最小配置（`max_seq_len_override=4096`）下应该是 `[257, 4096]`，可以自己打印确认。
+</Aside>
+
+**最后一行 dummy 是干什么的？**
+
+<SrcCode path="engine/engine.py" sym="Engine.__init__" from="self.dummy_req = Req(" to="self.page_table[self.dummy_req.table_idx].fill_(num_tokens)" />
+
+- `dummy_req` 的 `table_idx` 是 `max_running_req`，正好是最后一行。它只有 1 个输入 token，`cached_len=0`，所以每次它读的是位置 0。
+- KV 池创建时多分配了 1 页（`num_pages + 1`），`page_table` 最后一行整行填成 `num_tokens`，正好指向这多出来的哑页。dummy 请求算出的 K/V 全写到这里，不会污染任何真实请求的数据。实测记录里 KV 缓冲区的页数是 112,082，比 112,081 多出的就是这一页。
+- `token_pool` 初始化为 0，dummy 请求读到的输入是 token 0，一个合法的 token id。`TableManager` 里的注释说的就是这件事。
+
+CUDA graph 录制时，整批都是 dummy 请求；replay 时，用它把 decode 批补齐到录过的大小（<StageLink id="s7" />）。
+
+**行怎么分配？** `_free_slots` 一开始是 `[0, 1, ..., max_running_req - 1]`，`allocate` 用 `pop()` 从末尾取，`free` 用 `append` 放回末尾，后进先出。所以第一个请求拿到的是第 255 行，刚释放的行会被下一个请求最先拿到。<StageLink id="s5" /> 讲的 overlap 迟到写入问题，就和这个后进先出有关。行本身不清零：请求结束后，这一行的 `token_pool` 内容一直留着，直到下一个请求覆盖。
+
+**谁在读写这两张表：**
+
+| 表 | 写 | 读 |
+| --- | --- | --- |
+| `token_pool` | 准入时拷入 prompt（`PrefillAdder._add_one_req`，命中的前缀在 `_try_allocate_one`）；每一步把采样结果写到 `device_len` 列（`Scheduler._forward`） | `Scheduler._forward` 查出 `input_ids` |
+| `page_table` | 命中前缀时拷入缓存里的位置（`_try_allocate_one`）；每一步给新位置分配槽位（`CacheManager.allocate_paged`） | `_prepare_batch` 查出 `out_loc`；attention 后端准备 metadata；`cache_req` 把一段前缀交给前缀缓存 |
+
+## 常见误区
+
+- **「`table_idx` 就是请求的 `uid`」**：`uid` 是对外编号，服务模式下一直递增；`table_idx` 是表的行号，请求结束就还回去给别人用。
+- **「`cached_len` 表示 GPU 已经把这些 K/V 算完了」**：`complete_one` 在发射 kernel 之后马上调用，GPU 可能还没算。它是 CPU 这边的记账，正确性靠 CUDA stream 的顺序保证。
+- **「`input_ids` 的长度总等于 `device_len`」**：只在关掉 overlap、收尾之后成立。开着 overlap 时，收尾处理的是上一批，`input_ids` 比 `device_len` 少 1。
+- **「`page_table` 里存的是页号」**：存的是每个 token 在 KV 池里的物理位置，`page_size` 大于 1 时也一样。
+- **「生成了 `max_tokens` 个 token，就有这么多个 token 的 K/V」**：最后一个输出 token 只被采样出来，K/V 从没算过。
+
+## 自测题
+
+1. prompt 有 5 个 token，没有命中缓存，`max_tokens=3`，关掉 overlap。prefill 前后、每一步 decode 后，`cached_len` 和 `device_len` 各是多少？
+
+   <Answer>
+   prefill 前 0 / 5（`extend_len` 为 5）；prefill 后 5 / 6；第 1 步 decode 后 6 / 7；第 2 步 decode 后 7 / 8。这时 `device_len` 等于 `max_device_len`（5 + 3），`can_decode` 为 False，请求结束。一共 3 个输出 token，1 个来自 prefill，2 个来自 decode。
+   </Answer>
+
+2. 为什么 `Req` 断言 `cached_len < device_len`，连相等都不允许？
+
+   <Answer>
+   每一轮至少要送进 1 个 token，才能得到预测下一个 token 的 logits。所以前缀匹配只用 `input_ids[:-1]`，就算整个 prompt 都在缓存里，最后一个 token 也要重算。
+   </Answer>
+
+3. 第 3 轮 decode 发射时，`remain_len` 是 1，采样结果照样写进了 `token_pool`。这个 token 的 K/V 什么时候算？
+
+   <Answer>
+   永远不算。它是最后一个输出 token，发射之后 `complete_one` 让 `remain_len` 变成 0，请求结束，不会再作为输入送进模型。所以交给前缀缓存的只有 `input_ids[:cached_len]`，比 `input_ids` 少最后 1 个。
+   </Answer>
+
+4. `ChunkedReq` 为什么要让 `can_decode` 恒为 False？只靠 `append_host` 抛异常不行吗？
+
+   <Answer>
+   不行。`append_host` 只在收尾时才会被调用，而且收尾时 `ChunkedReq` 已经靠 `isinstance` 判断被跳过了。在那之前，`can_decode` 还控制着两件事：`filter_reqs` 不把它放进 decode 集合，`_make_write_tuple` 给它写 -1。`ChunkedReq` 的 `remain_len` 其实是正的，如果不改 `can_decode`，它会被当成可以继续 decode 的请求放进 decode 集合，没用的采样结果也会写进下一块 prompt 的第一个位置。`append_host` 抛异常只是最后一道保险。
+   </Answer>
+
+5. 一个 prefill 批里有两个请求，一个本轮输入 3 个 token，一个输入 5 个。`batch.input_ids`、`positions`、LM head 输出的 logits 各是什么形状？
+
+   <Answer>
+   `input_ids` 和 `positions` 都是长度 8 的一维张量，两个请求的输入拼在一起，不填充。LM head 只取每个请求的最后一个位置，logits 是 2 行，每行是词表大小。
+   </Answer>
+
+6. `model.forward()` 为什么不需要参数？这样设计对 CUDA graph 有什么好处？
+
+   <Answer>
+   输入、位置、attention metadata、KV 池、后端都挂在全局 `Context` 上，各层用 `get_global_ctx()` 取。录 CUDA graph 时，只要让 batch 的这些字段指向固定地址的 buffer，模型代码不用改；replay 前把真实数据拷进这些 buffer 就行。
+   </Answer>
+
+7. 默认配置下 `page_table` 为什么是 257 行？最后一行里存的是什么，指向哪里？
+
+   <Answer>
+   256 行给 `max_running_req` 个并发请求，最后 1 行给 dummy 请求。最后一行整行填的是 `num_tokens`，也就是 KV 池里真实 token 数的下一个位置：KV 池多分配了 1 页哑页，dummy 请求的 K/V 全写在那里。
+   </Answer>
+
+8. 进阶：`LLM.generate` 传一个 `SamplingParams` 对象给多个 prompt，其中一个 prompt 很长，触发了 `max_tokens` 截短。会影响别的请求吗？
+
+   <Answer>
+   按代码推断会。`generate` 用 `[sampling_params] * len(prompts)` 让所有请求共用同一个对象，离线模式下 `UserMsg` 直接持有这个对象，不经过序列化。`_process_one_msg` 截短时是原地改 `msg.sampling_params.max_tokens`，于是所有共用它的请求都受影响：`PendingReq.output_len` 每次都现读这个字段，还没创建 `Req` 的请求都会拿到截短后的值，调用方手里的对象也被改了。服务模式下每条消息都是反序列化出来的独立对象，没有这个问题。这一点没有实测过，可以自己设计一个实验验证。
+   </Answer>
+
+## 动手实验
+
+<Steps>
+
+1. **对照你的推导。** 先在纸上推出自测题 1 的答案。然后在 `Engine.forward_batch` 里 `req.complete_one()` 的前后各加一行 `print(batch.phase, req)`（`Req.__repr__` 会打出 `table_idx` 和三个长度），关掉 overlap，用 token id 列表送进一个 5 个 token 的 prompt、`max_tokens=3`：
+
+   ```python
+   llm.generate([[1000, 1001, 1002, 1003, 1004]], SamplingParams(max_tokens=3, ignore_eos=True))
+   ```
+
+   对照打印结果和你的推导。`table_idx` 是多少？为什么是它？
+
+2. **看一维拼接。** 在 `Scheduler._prepare_batch` 返回前打印 `batch.phase`、`batch.positions`、`input_mapping[0]` 和 `batch.out_loc`，一次送进两个长度不同的 prompt。对照上面 A、B 两个请求的例子，确认 `positions` 和行号是怎么拼起来的。再把 `cuda_graph_max_bs` 设成 8，送进 3 个 prompt，看 decode 批的 `positions` 和行号末尾多出来的那一项是什么。
+
+3. **看两张表。** 在最小配置下 `generate` 一次之后，打印：
+
+   ```python
+   print(llm.token_pool.shape, llm.engine.page_table.shape)
+   print(llm.engine.page_table[-1, :8])       # dummy 行
+   print(llm.token_pool[255, :30].tolist())   # 第一个请求用过的那一行
+   ```
+
+   用 <StageLink id="s1" /> 的最小脚本（5 个 token 的 prompt，`max_tokens=16`）跑。dummy 行的值应该等于最小配置下 KV 池的 token 数（实测是 57,147）。第三行和 prompt、输出的 token 对得上吗？从第几列开始是 0，为什么是这一列？
+
+4. **挑战：验证共享 `SamplingParams` 的问题。** 按自测题 8 的思路设计一个实验：用最小配置（`max_seq_len_override=4096`），一个短 prompt 在前、一个 4,000 个 token 的 prompt 在后，共用一个 `SamplingParams(max_tokens=200, ignore_eos=True)`。观察短 prompt 实际生成了多少个 token，以及 `generate` 返回后那个 `SamplingParams` 对象的 `max_tokens`。再改成每个 prompt 各传一个对象，比较结果。
+
+</Steps>
+
+## 过关标准
+
+- 能不看代码，对任意 prompt 长度和 `max_tokens` 推出每一步的 `cached_len`、`device_len`，并说出最后哪个 token 没有 K/V。
+- 能画出一个两请求的 prefill 批里 `positions`、行号、`input_ids`、`out_loc` 是怎么从两张表里查出来的。
+- 能说出 `page_table` 和 `token_pool` 的形状由什么决定，以及最后一行 dummy 的用途。

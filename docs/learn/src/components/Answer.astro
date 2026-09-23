@@ -1,0 +1,12 @@
+---
+// A collapsed reference answer under a self-check question.
+interface Props {
+	label?: string;
+}
+
+const { label = '参考答案' } = Astro.props;
+---
+<details class="answer">
+	<summary>{label}</summary>
+	<div class="answer-body"><slot /></div>
+</details>

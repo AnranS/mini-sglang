@@ -1,0 +1,49 @@
+---
+// Reading list for a stage. Line counts are computed from the source at build time.
+//   <FileTable files={[
+//     { path: 'core.py', note: '先看 `Req` 的三个长度' },
+//     { path: 'scheduler/scheduler.py', sym: 'Scheduler.overlap_loop', note: '...' },
+//   ]} />
+import InlineCode from './InlineCode.astro';
+import { describeRef, spanLines } from '../lib/source.mjs';
+
+type Entry = { path: string; sym?: string; text?: string; label?: string; note: string };
+
+interface Props {
+	files: Entry[];
+}
+
+const rows = Astro.props.files.map((f) => ({
+	...describeRef({ path: f.path, sym: f.sym, label: f.label ?? (f.sym ? `${f.path} · ${f.sym}` : undefined) }),
+	lines: spanLines({ path: f.path, sym: f.sym }),
+	note: f.note,
+}));
+---
+<div class="table-scroll">
+	<table class="file-table">
+		<thead>
+			<tr>
+				<th>读什么</th>
+				<th class="num">行数</th>
+				<th>读的时候盯住</th>
+			</tr>
+		</thead>
+		<tbody>
+			{
+				rows.map((r) => (
+					<tr>
+						<td>
+							<a class="src-ref" href={r.url} title={r.title} target="_blank" rel="noopener">
+								<code>{r.label}</code>
+							</a>
+						</td>
+						<td class="num">{r.lines}</td>
+						<td>
+							<InlineCode text={r.note} />
+						</td>
+					</tr>
+				))
+			}
+		</tbody>
+	</table>
+</div>

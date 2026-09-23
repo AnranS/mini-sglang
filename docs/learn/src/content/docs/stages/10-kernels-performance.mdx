@@ -1,0 +1,352 @@
+---
+title: 进阶：kernel 与性能
+description: JIT kernel 怎么编译和调用；用 benchmark 量出 overlap 和 CUDA graph 各省了多少，再用 profiler 看时间花在哪里。
+sidebar:
+  order: 10
+  label: 10 · 进阶：kernel 与性能
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import Answer from '~/components/Answer.astro';
+import FileTable from '~/components/FileTable.astro';
+import Src from '~/components/Src.astro';
+import SrcCode from '~/components/SrcCode.astro';
+import StageHeader from '~/components/StageHeader.astro';
+import StageLink from '~/components/StageLink.astro';
+
+<StageHeader id="s10" />
+
+## 这一阶段要搞懂什么
+
+前面九章把 kernel 当成黑盒：`store_cache` 把 K/V 写进池子，`indexing` 查 embedding，FlashInfer 算 attention。这一章打开黑盒的一角，看 mini-sglang 自己写的 kernel 怎么从一个 `.cu` 文件变成 Python 里能调用的函数，MoE 模型用的 Triton kernel 在做什么；然后换个角度，看怎么测、怎么找出时间花在了哪里。读完这一章，你应该能不看代码回答：
+
+- `store_cache` 第一次被调用时发生了什么？编译结果缓存在哪里、目录名里的数字是什么意思、什么时候会重新编译？
+- 为什么 `store_cache` 让一个 warp 搬一个 token 的 K（或 V）？
+- MoE 的 Triton kernel 怎么把「每个 token 选 k 个专家」变成一次分块矩阵乘？
+- 冷启动为什么比热启动慢这么多？慢在哪几步？
+- 离线 benchmark 的吞吐怎么算的？关掉 overlap、关掉 CUDA graph 各慢了多少？要看清时间花在哪里，profiler 里该找什么？
+
+这一章按兴趣读。前半部分（kernel）需要一点 CUDA 基础，后半部分（性能）只需要读过 <StageLink id="s5" /> 和 <StageLink id="s7" />。
+
+## 精读清单
+
+<FileTable files={[
+  { path: 'kernel/utils.py', sym: 'load_jit', note: '生成的源码长什么样，模块名怎么拼出来' },
+  { path: 'kernel/store.py', note: '`element_size` 怎么算，为什么要 `functools.cache`' },
+  { path: 'kernel/csrc/jit/store.cu', sym: 'store_kv_cache', note: '一个 warp 负责哪一段内存' },
+  { path: 'kernel/index.py', sym: 'indexing', note: '`num_splits` 按什么选' },
+  { path: 'kernel/csrc/jit/index.cu', sym: 'masked_index_kernel', note: '越界的 token 为什么不用显式判断负数' },
+  { path: 'moe/fused.py', sym: 'fused_experts_impl', note: '两次矩阵乘之间的中间结果放在哪' },
+  { path: 'kernel/triton/fused_moe.py', sym: 'fused_moe_kernel', note: '`offs_token // top_k` 在还原什么' },
+  { path: 'utils/torch_utils.py', sym: 'nvtx_annotate', note: '标注打在 CPU 上还是 GPU 上' },
+  { path: 'benchmark/perf.py', sym: 'perf_cuda', note: '为什么要把被测函数录进 CUDA graph' },
+  { path: '/benchmark/offline/bench.py', note: '吞吐的分子和分母各是什么' },
+  { path: 'benchmark/client.py', sym: 'process_benchmark_results', note: 'TTFT、TPOT 从哪两个时间戳算' },
+]} />
+
+## 讲解
+
+### 三类 kernel
+
+mini-sglang 用到的 GPU kernel 来自三个地方：
+
+| 来源 | 有哪些 | 在哪里调用 |
+| --- | --- | --- |
+| 自己写的 CUDA / C++，用 tvm-ffi 编译 | `store_cache`（写 KV）、`indexing`（查 embedding）、`fast_compare_key`（radix 树比较前缀，跑在 CPU 上）、PyNCCL 通信 | `kvcache/mha_pool.py`、`layers/embedding.py`、`kvcache/radix_cache.py`、`distributed/impl.py` |
+| 自己写的 Triton | MoE 的 `fused_moe_kernel` 和 `moe_sum_reduce_kernel` | `moe/fused.py` |
+| 第三方库 | FlashInfer：attention、RMSNorm、RoPE、`silu_and_mul`、采样；`sgl_kernel`：FlashAttention、MoE 的 top-k 和对齐；TensorRT-LLM 的 attention 也经由 FlashInfer 调用 | `attention/`、`layers/`、`engine/sample.py`、`moe/fused.py` |
+
+它们有一个共同点：**第一次用到时才编译**。自己写的 CUDA kernel 由 tvm-ffi 调 `nvcc` 编译，Triton kernel 由 Triton 编译，FlashInfer 的很多 kernel 也是现场 JIT 编译。所以运行 mini-sglang 的机器上除了显卡驱动，还需要完整的 CUDA 工具链（`nvcc` 和 C++ 编译器）。
+
+`kernel/__init__.py` 把这些入口集中导出。调用方都在函数体里 `from minisgl.kernel import ...`，而不是在文件开头导入，这样只有真正用到时才触发编译：Qwen3-0.6B 这种稠密模型永远不会去编译 MoE 的 kernel。
+
+### `load_jit`：把模板实例化成一个模块
+
+<SrcCode path="kernel/utils.py" sym="load_jit" from="# include cpp files" to="build_directory=build_directory," />
+
+`load_jit` 不直接编译 `.cu` 文件，而是**拼一段新的源码**交给 `tvm_ffi.cpp.load_inline`：
+
+1. 对每个 `.cu` 文件生成一行 `#include "<绝对路径>"`。
+2. 对每个要导出的函数生成一行 `TVM_FFI_DLL_EXPORT_TYPED_FUNC(导出名, (C++ 函数))`。C++ 函数可以是一个模板实例，例如 `StoreKernel<2048,128,1,false>::run`，模板参数由 Python 这边决定。
+3. 模块名由 `_make_name` 拼成：`minisgl__` 加上所有参数，例如 `minisgl__store_2048_128_1_false`。
+
+`load_inline` 做的事，以本机安装的 apache-tvm-ffi 0.1.14 的源码为准：
+
+- 在缓存目录 `~/.cache/tvm-ffi`（可以用环境变量 `TVM_FFI_CACHE_DIR` 改）下建一个子目录，名字是「模块名 + 源码和编译参数的哈希」。
+- 把拼好的源码写成 `cuda.cu` 和 `main.cpp`，生成 `build.ninja`，然后**每次加载都调用一次 ninja**，由 ninja 判断要不要重新编译，最后加载编出来的 `.so`。
+
+在 RTX 4080 SUPER 上跑过一次之后，`store` 模块的缓存目录里是这样的（摘录）：
+
+```text
+~/.cache/tvm-ffi/minisgl__store_2048_128_1_false_0ed6d2a132432c9c/
+  cuda.cu        #include ".../kernel/csrc/jit/store.cu"
+                 TVM_FFI_DLL_EXPORT_TYPED_FUNC(launch, (StoreKernel<2048, 128, 1, false>::run));
+  build.ninja    cuda_cflags = ... -gencode=arch=compute_89,code=sm_89 -std=c++20 -O3 --expt-relaxed-constexpr ...
+                 rule compile_cuda: $nvcc --generate-dependencies-with-compile --dependency-output $out.d ...
+  minisgl__store_2048_128_1_false.so
+```
+
+两个细节值得注意：
+
+- 哈希只覆盖拼出来的那几行源码（也就是 `#include` 的路径）和编译参数，**不覆盖 `store.cu` 的内容**。改了 `store.cu`，目录名不变；但 `nvcc` 生成了依赖文件，ninja 知道 `cuda.cu` 依赖 `store.cu` 和它 include 的头文件，所以会在同一个目录里重新编译。
+- 模板参数不同，就是不同的模块、不同的目录。`element_size` 换一个值，就会多编译一个。
+
+`load_aot` 是另一种加载方式，用于没有模板参数的文件（`csrc/src/` 下的 `radix.cpp`、`pynccl.cu`、`tensor.cpp`），直接把文件交给 `tvm_ffi.cpp.load`。名字里的 AOT 容易让人误会：它同样是在第一次调用时编译，只是不需要按参数实例化模板。PyNCCL 模块多一个 `-lnccl` 链接参数（<StageLink id="s9" />）。
+
+开发 kernel 时，`python -m minisgl.kernel` 会按本机显卡的计算能力生成一个 `.clangd` 配置，让编辑器能找到 tvm-ffi 的头文件。
+
+### Python 一侧：`store_cache`
+
+<SrcCode path="kernel/store.py" from="@functools.cache" to="module.launch(k_cache, v_cache, indices, k, v)" />
+
+- `element_size` 是**一个 token 在一层里的 K（或 V）占多少字节**。KV 池的每一层先被 `view` 成 `[token 数, KV head × head_dim]` 的二维表，一行就是一个 token。Qwen3-0.6B 有 8 个 KV head、`head_dim` 是 128、bfloat16 占 2 字节，所以 `element_size` = 8 × 128 × 2 = 2,048，对应上面那个目录名里的 `2048`。
+- `_jit_store_module` 用 `functools.cache` 按参数缓存。同一个进程里，第一次调用走一遍 `load_jit`（没有缓存时要编译），之后每一层、每一步都直接拿到同一个模块。
+- `module.launch(...)` 直接收 PyTorch 张量。tvm-ffi 通过 DLPack 拿到张量的指针、形状和 stride，并取 PyTorch **当前的 CUDA stream** 作为 kernel 的 stream（tvm-ffi 在转换参数时查询当前工作 stream，C++ 那边用 `TVMFFIEnvGetStream` 取出来）。所以这个 kernel 会老老实实地排在引擎 stream 上，也能被录进 CUDA graph。
+
+谁在调用它？<Src path="kvcache/mha_pool.py" sym="MHAKVCache.store_kv" /> 在每一层 attention 里把这一批新算出的 K、V 按 `out_loc` 写进池子，`out_loc` 就是 <StageLink id="s4" /> 讲的 token 物理位置。
+
+### CUDA 一侧：一个 warp 搬一行
+
+<SrcCode path="kernel/csrc/jit/store.cu" from="template <std::size_t kNumThreads, std::size_t kMaxOccupancy, bool kUsePDL," to="PDL::launch<kUsePDL>();" />
+
+- 一个 block 有 128 个线程，也就是 4 个 warp。`warp_id` 是全局的 warp 编号，**每个 warp 负责一个 token**：从 `indices` 读出它在池子里的位置 `pos`，把输入的第 `warp_id` 行拷到池子的第 `pos` 行，K 和 V 各一次。
+- 为什么按 token 分给 warp？一个 token 的一行是连续的 2,048 字节，而不同 token 的目标位置是离散的。让 32 个线程合作搬一行，每次访存都落在连续地址上，能合并成少数几次内存事务；如果让一个线程搬一整行，同一个 warp 里的 32 个线程会同时访问 32 个相距很远的地址。
+- 真正的拷贝在 `warp.cuh` 的 `warp::copy` 里：按 `kElementSize` 在编译期选每个线程每次搬 16、8 还是 4 字节（`uint4`、`uint2`、`uint1`），循环次数也是编译期常量，会被完全展开。这就是 `element_size` 要做成模板参数的原因。
+- `PDL::wait` 和 `PDL::launch` 对应 Hopper 以后的 programmatic dependent launch，让下一个 kernel 提前开始准备。默认配置里 `use_pdl=False`，这两行编译后什么都不做。
+
+kernel 之外，`StoreKernel::run` 在 host 上用 `TensorMatcher` 检查形状、stride、dtype 和设备是否一致，并用 `RuntimeCheck` 确认实际的一行字节数等于模板参数 `element_size`。下标可以是 int32 或 int64，两种各实例化一份 kernel，运行时按 dtype 选。
+
+`indexing`（查 embedding 表）是同一个套路，只是一行更长：
+
+<SrcCode path="kernel/index.py" sym="indexing" />
+
+Qwen3-0.6B 的 hidden size 是 1,024，一行 2,048 字节，能被 2,048 整除，所以 `num_splits` 取 4：每一行由 4 个 warp 分着搬，每个 warp 搬 512 字节。行越长，拆给越多 warp，单个 warp 的工作量就不会太大。张量并行时每张卡只有词表的一段，传进来的 `vocab_range` 会让 kernel 走 `masked_index_kernel`：不属于本卡的 token 那一行填 0，之后由 all-reduce 求和得到完整结果（<StageLink id="s9" />）。
+
+### Triton 写的 MoE
+
+MoE（混合专家）模型的每一层有很多个 MLP（专家），每个 token 只选其中 k 个。朴素的做法是按专家循环、每个专家挑出自己的 token 做一次矩阵乘，kernel 次数和专家数成正比。`moe/fused.py` 用一个 Triton kernel 把所有专家的矩阵乘一起做掉：
+
+<SrcCode path="moe/fused.py" sym="fused_experts_impl" from="sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(" to="return out_hidden_states" />
+
+一次 MoE 层的前向分五步（`FusedMoe.forward` 先做第 1 步，再调 `fused_experts_impl`）：
+
+1. `fused_topk`：用 `sgl_kernel` 的 `topk_softmax` 对路由 logits 做 softmax 并取前 k 个，得到每个 token 的专家编号 `topk_ids` 和权重 `topk_weights`。
+2. `moe_align_block_size`：把所有「(token, 第几个专家)」对展平、按专家排序，再把每个专家分到的数量补齐到 `BLOCK_SIZE_M` 的倍数。补齐用的是一个不存在的编号（等于有效对数），后面会被 mask 掉。这样每个 `BLOCK_SIZE_M` 行的块只属于一个专家，块对应的专家记在 `expert_ids` 里。
+3. 第一次 `fused_moe_kernel`：每个 (token, k) 对乘上所选专家的 `gate_up_proj`，结果写进 `intermediate_cache1`，形状 `[M, top_k, N]`。
+4. `silu_and_mul` 把 gate 和 up 合成一半宽度，写进 `intermediate_cache2`；第二次 `fused_moe_kernel` 乘 `down_proj`，这次乘上路由权重（传的是 `not apply_router_weight_on_input`，默认为 True），写进 `intermediate_cache3`。
+5. `moe_sum_reduce_triton` 把每个 token 的 k 份结果加起来。
+
+几个容易看漏的地方：
+
+- `intermediate_cache1` 和 `intermediate_cache3` 是同一块 `cache` 的两个视图。这是安全的：cache1 在第 4 步被 `silu_and_mul` 读完之后，cache3 才被写，同一个 stream 上的顺序保证了这一点。省下的是一整块中间结果的显存。
+- 第二次矩阵乘传的 `top_k` 是 1，因为 `intermediate_cache2` 已经是「每个 (token, k) 对一行」了，不需要再从 token 行号换算。
+- 最后的求和直接写进 `hidden_states` 本身（`out_hidden_states = hidden_states`），输出覆盖了输入。
+- 分块大小由 `get_default_config` 给出，只区分 token 数是否不超过专家数两种情况，没有针对具体显卡调过参。
+
+kernel 本身的核心是这一段：
+
+<SrcCode path="kernel/triton/fused_moe.py" sym="fused_moe_kernel" from="num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)" to="accumulator += tl.dot(a, b)" />
+
+- 每个 program 算输出的一个 `[BLOCK_SIZE_M, BLOCK_SIZE_N]` 块。这段之前的几行把一维的 `pid` 按组排列（`GROUP_SIZE_M`），让相邻的 program 复用同一批 B 的块，提高 L2 命中率。
+- `offs_token` 是排好序的 (token, k) 对编号，`offs_token // top_k` 还原成 A 的行号：同一个 token 的 k 个副本读的是同一行输入。
+- `token_mask` 把补齐用的假编号屏蔽掉，读成 0、也不写回。
+- 整个块只读一个专家的权重：`off_experts = tl.load(expert_ids_ptr + pid_m)`。这正是第 2 步补齐的意义。
+
+Triton 的 kernel 同样在第一次调用时编译，按 `tl.constexpr` 参数（块大小、`top_k`、`compute_type` 等）的组合各编一份，默认缓存在 `~/.triton/cache`。本站的实测全部用 Qwen3-0.6B，这是稠密模型，这条路径没有被实测覆盖；想跑的话需要一个 `Qwen3MoeForCausalLM` 结构的模型。
+
+### FlashInfer 的 JIT：冷启动慢在哪
+
+[实测记录](../../appendix/measurements/)里，默认配置在 RTX 4080 SUPER 上：
+
+| | 冷启动 | 热启动 |
+| --- | --- | --- |
+| 创建 `LLM`（加载权重、分配 KV 池、录 CUDA graph） | 41.25 s | 5.78 s |
+| 第一次 `generate` | 13.23 s | 0.235 s |
+
+加载权重本身只用了 1.5 s。冷启动的日志里能看到 FlashInfer 编译了三个 JIT 模块：录 CUDA graph 的过程中编译了 `rope` 和 `silu_and_mul`，第一个请求的 prefill 又编译了 `batch_prefill_with_kv_cache`。编译结果缓存在 `~/.cache/flashinfer` 下按版本分的子目录里。
+
+为什么有两个模块是在「录 CUDA graph」时编译的？看录制的循环：
+
+<SrcCode path="engine/graph.py" sym="GraphRunner._capture_graphs" from="with get_global_ctx().forward_batch(batch):" to="pool = graph.pool()" />
+
+每个 batch size 录制之前，先用同样的输入**不录制地**跑一遍 `model.forward()`。第一次进这个循环时，这就是进程里的第一次前向：各层第一次调到 RoPE、`silu_and_mul` 等，JIT 编译就发生在这里。编译、分配 workspace 这类事情不能出现在 `torch.cuda.graph` 的录制过程中，先跑一遍正好把它们挪到了录制之前。而 prefill 的 attention 不在 CUDA graph 里（graph 只录 decode），所以它的 kernel 要等到第一个真正的 prefill 才编译。
+
+同一遍前向里，mini-sglang 自己的 `store_cache` 和 `indexing` 也是第一次被调用，会触发 tvm-ffi 的编译。实测记录没有把这部分的耗时单独拆出来；想知道的话，可以让 `TVM_FFI_CACHE_DIR` 指向一个空目录再跑，见下面的动手实验。
+
+<Aside type="tip" title="部署时的含义">
+服务刚启动时第一个请求慢，是正常的。可以在启动后先发一个请求预热，并把 `~/.cache/flashinfer`、`~/.cache/tvm-ffi` 这些缓存目录保留下来。`benchmark/offline/bench.py` 在计时之前先 `generate` 一次，注释写的就是 `to warm up flashinfer`。
+</Aside>
+
+### 性能工具：NVTX、微基准和 benchmark
+
+**NVTX 标注。** 模型代码里到处是 `@nvtx_annotate(...)`：
+
+<SrcCode path="utils/torch_utils.py" sym="nvtx_annotate" />
+
+它只是在函数外面包一层 `torch.cuda.nvtx.range`。用到的名字有 `Layer_0`、`Layer_1`……（每个 decoder 层）、`MHA`、`MLP`、`Embedding`、`LMHead`、`Sampler`。在 Nsight Systems 里，这些名字会出现在 NVTX 那一行，帮你把 GPU 上的 kernel 对应回模型的哪一层。
+
+要记住两件事。第一，NVTX 范围标的是 **CPU 执行这段 Python 的时间**，也就是发射 kernel 的时间，不是 GPU 执行的时间；GPU 是异步的，真正的执行通常晚一些。第二，**CUDA graph replay 时不执行 Python**，模型的 `forward` 根本没有被调用，所以用 graph 跑的 decode 步里不会有 `Layer_i`、`MHA` 这些范围。采样在 graph 之外（<Src path="engine/engine.py" sym="Engine.forward_batch" /> 在 replay 之后才采样），所以每一步都有 `Sampler`。`Sampler.sample` 同时用了装饰器和 `with torch.cuda.nvtx.range("Sampler")`，你会看到两层同名的范围套在一起。
+
+**kernel 微基准。** <Src path="benchmark/perf.py" sym="perf_cuda" /> 给单个 kernel 计时：先跑一次预热，再把被测函数连续调用 N 次录进一个 CUDA graph，用 CUDA event 给多次 replay 计时，除以总调用次数。录进 graph 是为了去掉 Python 和 kernel 发射的开销，只剩 GPU 执行时间。<Src path="benchmark/perf.py" sym="compare_memory_kernel_perf" /> 在此基础上按「搬了多少字节 ÷ 时间」算出带宽（GB/s）。`tests/kernel/test_store.py` 和 `test_index.py` 就是用它把自己的 kernel 和 PyTorch 写法（`test_store.py` 里是 `torch.compile` 过的下标赋值）比较，batch size 从 1 一直测到 32,768。这两个文件可以直接用 `python` 运行。
+
+**离线 benchmark。** `benchmark/offline/bench.py` 用 benchmark 配置（`max_seq_len_override=4096`、`max_extend_tokens=16384`、`cuda_graph_max_bs=256`、`page_size=256`）跑 256 个请求：prompt 长度在 100 到 1,024 之间随机（token id 也是随机的），`max_tokens` 在 100 到 1,024 之间随机，`ignore_eos=True`，`temperature=0.6`。吞吐等于所有请求的 `max_tokens` 之和除以一次 `generate` 的墙钟时间。分子只有**输出** token（这次是 133,966 个），分母里却包含了 prefill 的时间。实测：
+
+| 设置 | 用时 | 吞吐 | 相对默认 |
+| --- | --- | --- | --- |
+| overlap 开，CUDA graph 开（默认） | 31.27 s | 4,285 token/s | |
+| overlap 关（`MINISGL_DISABLE_OVERLAP_SCHEDULING=1`） | 34.75 s | 3,855 token/s | 慢 10% |
+| CUDA graph 关（`cuda_graph_max_bs=0`） | 34.17 s | 3,920 token/s | 慢 8.5% |
+
+每组只跑了一次，重复运行会有几个百分点的波动。两个开关是各关一个测的，没有测过同时关掉的情况。同一目录下的 `bench_wildchat.py` 用 WildChat 数据集里真实的中英文 prompt，不忽略 EOS，按实际生成的 token 数算吞吐，本站没有实测。
+
+**在线压测。** 在线 benchmark 需要先用 `python -m minisgl --model ...` 起服务（默认端口 1919），客户端的公共代码在 `minisgl/benchmark/client.py`：
+
+- `benchmark/online/bench_simple.py`：64 个请求同时发出，输入长度在 1 到 8,192 之间随机，输出长度在 16 到 1,024 之间随机。
+- `benchmark/online/bench_qwen.py`：下载阿里巴巴公开的 Qwen 请求 trace，取前 1,000 条，按 trace 里的时间戳重放。`SCALES` 是时间戳的缩放系数，越小请求来得越密。
+
+每个请求都是流式的 chat completion，带 `ignore_eos=True`、`top_k=1`。客户端给每个收到的流式分块记一个时间戳，<Src path="benchmark/client.py" sym="process_benchmark_results" /> 由此算出 TTFT（第一个分块和请求返回之间的间隔）、TPOT（之后相邻分块的间隔）、端到端时间和吞吐。读结果时注意三点：
+
+- 第一个时间戳是在 `create()` 返回、也就是响应头回来之后记的，比真正发出请求晚一点。
+- 吞吐里的 token 数用的是时间戳的个数，每个请求比输出 token 多出两个左右：开头那个时间戳，以及服务端最后发的那个只带 `finish_reason` 的分块。
+- 客户端传的 `input_length_override` 不在服务端的请求模型 `OpenAICompletionRequest` 里，会被忽略。
+
+### 时间花在哪里
+
+把 <StageLink id="s5" /> 的一轮循环按「谁在干活」拆开，一个 decode 步的时间大致落在这几处：
+
+1. **CPU 调度和准备。** 收消息、选批，然后 `_prepare_batch`：分配 KV 槽位、写 `page_table`、构造各种下标张量并拷到 GPU、准备 attention 的 metadata。
+2. **CPU 发射 kernel。** 不用 CUDA graph 时，每一层要发射 norm、QKV 投影、RoPE、写 KV、attention、输出投影、MLP 等一串 kernel，28 层就是几百次发射；用 graph 时只有一次 replay，外加把输入拷进 graph 的固定缓冲区。FlashInfer 的 `plan` 也在这一步执行，它在 CPU 上算好调度信息，再异步拷到 GPU。
+3. **GPU 计算。** decode 每个请求只算 1 个 token，却要把权重和整段 KV 都读一遍，是访存密集的（<StageLink id="s0" />）；prefill 一次算很多 token，是计算密集的。
+4. **CPU 收尾。** 等采样结果拷回 CPU（`copy_done.synchronize()`），判断谁结束了，释放资源，发消息。
+
+overlap 把第 1、4 步藏到 GPU 计算的背后，CUDA graph 把第 2 步压成一次发射。实测里关掉任何一个都慢了 10% 左右，说明对 0.6B 这样的小模型，每一步 GPU 计算很短，CPU 那几步占的比例不小。换成大模型，GPU 计算变长，这两项的相对收益应该会变小；这一点是推断，没有实测。
+
+还有一处值得在 profiler 里留意：<Src path="attention/fi.py" sym="FlashInferBackend._initialize_metadata_once" /> 在每次 `plan` 之前都要 `last_event.synchronize()`，等上一次 `plan` 发出的异步拷贝完成（来龙去脉见[用 git 历史重走作者的路](../../appendix/git-history/)的修 bug 练习）。这是 overlap 模式下 CPU 的一个等待点，它在你的机器上占多少时间，需要自己测。
+
+<Aside type="caution" title="看 profiler 时别被自己骗了">
+关掉 CUDA graph 才能在 NVTX 里看到 decode 每一层的范围，但关掉 graph 本身就改变了 CPU 的开销（实测吞吐慢了 8.5%）。所以「看每一层各占多少」和「看整体时间线」最好分两次采集，结论不要混在一起。
+</Aside>
+
+## 常见误区
+
+- **「`load_aot` 的模块在安装时就编译好了」**：不是。`load_aot` 和 `load_jit` 都在第一次调用时编译，区别只在于 `load_aot` 编译的是没有模板参数的固定文件，`load_jit` 要按 Python 传来的参数实例化模板。
+- **「改了 `store.cu` 要手动删掉缓存目录」**：不用。目录名的哈希不包含 `.cu` 文件的内容，但每次加载都会跑 ninja，ninja 通过 `nvcc` 生成的依赖文件发现被 include 的文件变了，就会在原目录里重新编译。
+- **「冷启动慢是因为加载权重慢」**：实测里加载权重只用了 1.5 s，冷、热启动相差的几十秒主要花在 JIT 编译上。
+- **「NVTX 范围有多长，GPU 就算了多久」**：NVTX 标的是 CPU 执行那段 Python 的时间。GPU 异步执行，要看 GPU 时间得看 CUDA 那几行里 kernel 的位置。
+- **「关 overlap 慢 10%、关 CUDA graph 慢 8.5%，两个都关就慢 18.5%」**：实测只是各关一个。两者省的都是 CPU 开销，可能有重叠，不能直接相加。
+
+## 自测题
+
+1. `load_jit` 和 `load_aot` 有什么区别？哪一个会在 `pip install` 的时候编译？
+
+   <Answer>
+   都不会在安装时编译，都是第一次调用时由 tvm-ffi 调 `nvcc` 或 C++ 编译器编译，结果缓存在 `~/.cache/tvm-ffi`。`load_jit` 用于 `csrc/jit/` 下带模板参数的 kernel，会拼出 `#include` 加 `TVM_FFI_DLL_EXPORT_TYPED_FUNC(launch, (StoreKernel<...>::run))` 这样的源码，每组参数一个模块；`load_aot` 用于 `csrc/src/` 下的固定文件，直接编译，模块名里没有参数。
+   </Answer>
+
+2. 缓存目录 `minisgl__store_2048_128_1_false_<哈希>` 里的 2048、128、1、false 分别是什么？如果换成 Llama-3-8B（8 个 KV head，`head_dim` 128，bfloat16），`store` 模块要不要重新编译？
+
+   <Answer>
+   依次是 `element_size`（一个 token 一层的 K 或 V 的字节数）、每个 block 的线程数、每个 SM 最多驻留几个 block、是否启用 PDL。Llama-3-8B 的 `element_size` 是 8 × 128 × 2 = 2,048，和 Qwen3-0.6B 一样，所以直接复用同一个模块。`indexing` 就不一样了：它的一行是 hidden size × 2 字节，Llama-3-8B 的 hidden size 是 4,096，一行 8,192 字节，会编译一个新的 `minisgl__index_8192_4_...` 模块。
+   </Answer>
+
+3. `warp::copy` 搬一行 2,048 字节时，每个线程每次搬多少字节？循环几次？
+
+   <Answer>
+   2,048 能被 16 × 32 = 512 整除，所以每个线程每次搬 16 字节（`uint4`），一个 warp 一次循环搬 512 字节，循环 4 次。这些都是编译期常量，循环会被完全展开。
+   </Answer>
+
+4. `masked_index_kernel` 里 `pos = indices[...] - start`，只检查了 `pos < length`，没有检查 `pos >= 0`。编号比本卡词表范围小的 token 会不会读越界？
+
+   <Answer>
+   不会。`start` 是 `std::size_t`，有符号的下标减去无符号数，结果按无符号数计算。token id 小于 `start` 时差是负数，转成无符号后变成一个非常大的数，`pos < length` 不成立，走 `warp::reset` 把这一行填 0。一次比较同时挡住了两头。
+   </Answer>
+
+5. `fused_experts_impl` 里 `intermediate_cache1` 和 `intermediate_cache3` 指向同一块显存，为什么不会互相踩？第二次 `fused_moe_kernel` 为什么传 `top_k=1`？
+
+   <Answer>
+   cache1 是第一次矩阵乘的输出，在 `silu_and_mul` 里被读完，结果写进独立的 cache2；之后第二次矩阵乘才写 cache3。这几个 kernel 在同一个 stream 上按顺序执行，写 cache3 时 cache1 已经没用了。第二次的输入 cache2 已经是每个 (token, k) 对一行，kernel 里 `offs_token // top_k` 要直接等于行号，所以 `top_k` 传 1。
+   </Answer>
+
+6. 为什么 FlashInfer 的 `rope`、`silu_and_mul` 是在录 CUDA graph 的时候编译的，而 `batch_prefill_with_kv_cache` 要等到第一个请求？
+
+   <Answer>
+   `_capture_graphs` 在录制每个 batch size 之前，先不录制地跑一遍 `model.forward()`。第一次跑的时候就是进程里的第一次前向，RoPE 和激活函数第一次被调用，于是在这里编译。CUDA graph 只录 decode 批，prefill 的 attention kernel 在录制时根本没有被调用，要等第一个真正的 prefill 才编译。
+   </Answer>
+
+7. `bench.py` 算出的 4,285 token/s 里，分子和分母各是什么？它和在线 benchmark 的吞吐能直接比吗？
+
+   <Answer>
+   分子是 256 个请求的 `max_tokens` 之和（`ignore_eos=True`，所以等于实际输出的 token 数，这次是 133,966），分母是一次 `generate` 的墙钟时间，包括 prefill 和 decode，不包括之前预热的那一次。在线 benchmark 的吞吐是「流式分块的时间戳个数除以最早到最晚时间戳的跨度」，多了 HTTP、tokenizer、反分词器和进程间通信，负载和计数方式也不同，不能直接比。
+   </Answer>
+
+8. 进阶：用 Nsight Systems 采集默认配置下的 `bench.py`，decode 阶段的 NVTX 行里看不到 `Layer_0`、`MHA`，只看到 `Sampler`。为什么？怎么才能看到？代价是什么？
+
+   <Answer>
+   NVTX 范围是 Python 代码执行时在 CPU 上打的。decode 批走 CUDA graph replay，模型的 `forward` 不执行，所以没有层级的范围；采样在 graph 之外，每一步都执行，所以能看到 `Sampler`。把 `cuda_graph_max_bs` 设成 0 关掉 graph，decode 也会逐层执行，就能看到了。代价是关掉 graph 后 CPU 发射开销变大，时间线本身变了（实测吞吐慢 8.5%），看到的每层耗时比例不代表开 graph 时的情况。
+   </Answer>
+
+## 动手实验
+
+<Steps>
+
+1. **看 JIT 编译和缓存。** 让 tvm-ffi 用一个空的缓存目录，不动你已有的缓存：
+
+   ```python title="jit_cache.py"
+   import time
+
+   t = time.time()
+   from minisgl.core import SamplingParams
+   from minisgl.llm import LLM
+
+   llm = LLM(
+       "Qwen/Qwen3-0.6B",
+       attention_backend="fi",
+       max_seq_len_override=4096,
+       cuda_graph_max_bs=8,
+       memory_ratio=0.5,
+   )
+   print(f"create LLM: {time.time() - t:.2f} s")
+   llm.generate(["The capital of France is"], SamplingParams(max_tokens=4))
+   llm.shutdown()
+   ```
+
+   用 `TVM_FFI_CACHE_DIR=/tmp/tvmffi-lab python jit_cache.py` 运行，然后 `ls /tmp/tvmffi-lab`。观察：多出了哪几个 `minisgl__` 开头的目录？名字里的数字能不能用本章的公式算出来？同样的命令再运行一次，创建 `LLM` 的时间变了多少？然后在 `kernel/csrc/jit/store.cu` 里加一行注释，第三次运行，确认目录名没变、但目录里 `.o` 和 `.so` 的修改时间变了。
+
+2. **跑 kernel 微基准，再改一个参数。** 运行 `python tests/kernel/test_store.py`，观察带宽随 batch size 怎么变化、在多大的 batch 之后不再上升，自己的 kernel 和 `torch.compile` 的写法在小 batch 和大 batch 时谁快。这个测试的 KV 是 float16、每行 128 个元素，`element_size` 是 256，所以编出来的是 `minisgl__store_256_128_1_false`。然后把 `kernel/store.py` 里 `DEFAULT_INDEX_KERNEL_CONFIG` 的 `num_threads` 从 128 改成 256，重跑：缓存目录里是不是多了一个 `minisgl__store_256_256_1_false`？带宽有没有变化？做完记得改回来。
+
+3. **用 `torch.profiler` 看两条 stream。** 负载不要太大，否则 trace 文件会非常大：
+
+   ```python title="profile_decode.py"
+   from torch.profiler import ProfilerActivity, profile
+   from minisgl.core import SamplingParams
+   from minisgl.llm import LLM
+
+   llm = LLM(
+       "Qwen/Qwen3-0.6B",
+       attention_backend="fi",
+       max_seq_len_override=4096,
+       cuda_graph_max_bs=8,
+       memory_ratio=0.5,
+   )
+   prompts = [list(range(1000, 1200)) for _ in range(8)]
+   params = SamplingParams(max_tokens=32, ignore_eos=True)
+   llm.generate(prompts, params)  # 预热，避免把 JIT 编译录进去
+
+   with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+       llm.generate(prompts, params)
+   prof.export_chrome_trace("minisgl_trace.json")
+   print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+   llm.shutdown()
+   ```
+
+   把 `minisgl_trace.json` 拖进 [Perfetto](https://ui.perfetto.dev/)。观察：GPU 上有几条 stream，哪一条上是模型的 kernel，哪一条上主要是小的内存拷贝？prefill 那一步和之后的 decode 步在时间线上长得有什么不同？decode 步之间，模型 kernel 所在的 stream 上有没有空隙？再加上 `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` 采一次，对比 decode 步之间的空隙，以及 CPU 上 `cudaEventSynchronize` 出现的位置。最后把 `cuda_graph_max_bs` 改成 0 再采一次，看每个 decode 步里 kernel 发射的次数怎么变。注意第二次 `generate` 用的是同样的 prompt，radix cache 会命中，prefill 只算剩下的部分（<StageLink id="s6" />）。
+
+4. **复现吞吐表，再用 Nsight Systems 对上 NVTX。** 先不加 profiler，把 `python benchmark/offline/bench.py` 按实测表的三种设置各跑一次，和实测表对照（换了显卡，数字会不同，看相对关系）。然后把脚本里的 `num_seqs` 改小（例如 32），用 `nsys profile -t cuda,nvtx,osrt -o minisgl python benchmark/offline/bench.py` 采集。观察：NVTX 行里 prefill 步能不能看到 `Layer_0` 到 `Layer_27`？decode 步里是不是只剩 `Sampler`？每个 decode 步里 GPU 在忙的时间占整个步长的多少？
+
+</Steps>
+
+## 过关标准
+
+- 能说出 `store_cache` 第一次被调用时经过的每一步：拼源码、按参数定目录、ninja 编译、加载 `.so`、在当前 stream 上发射，并解释目录名里每个数字的来历。
+- 能讲清 fused MoE 为什么要先按专家排序并补齐到块大小，以及两次矩阵乘的中间结果放在哪里。
+- 能拿着实测表解释 overlap 和 CUDA graph 各自省掉的是一个 decode 步里的哪一段时间，并说出在 profiler 里用什么现象验证。

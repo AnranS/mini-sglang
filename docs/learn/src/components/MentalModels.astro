@@ -1,0 +1,32 @@
+---
+import InlineCode from './InlineCode.astro';
+import { MODELS } from '../data/models.mjs';
+import { describeRef } from '../lib/source.mjs';
+
+const models = MODELS.map((m) => ({ ...m, refs: m.refs.map(describeRef) }));
+---
+<ol class="mental-models not-content">
+	{
+		models.map((m, i) => (
+			<li class="mental-model">
+				<span class="mental-model-num" aria-hidden="true">
+					{i + 1}
+				</span>
+				<div>
+					<h3>{m.title}</h3>
+					<p>
+						<InlineCode text={m.body} />
+					</p>
+					<p class="mental-model-refs">
+						{m.refs.map((r) => (
+							<a class="src-ref" href={r.url} title={r.title} target="_blank" rel="noopener">
+								<code>{r.label}</code>
+								{r.loc && <span class="src-ref-loc">{r.loc}</span>}
+							</a>
+						))}
+					</p>
+				</div>
+			</li>
+		))
+	}
+</ol>

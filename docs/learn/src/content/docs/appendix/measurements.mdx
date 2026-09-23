@@ -1,0 +1,158 @@
+---
+title: 实测记录
+description: 各章引用的数字从哪里来：硬件、配置、原始结果和复现方法。
+sidebar:
+  order: 1
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import Src from '~/components/Src.astro';
+import StageLink from '~/components/StageLink.astro';
+
+各章里凡是写了具体数字的地方，都来自这一页的实验。换一张显卡、换一个版本，数字都会变，但数量关系（谁大谁小、大概差多少）通常不会变。自己动手时，可以把结果和这里对照。
+
+## 测试环境
+
+| 项目 | 值 |
+| --- | --- |
+| 显卡 | NVIDIA RTX 4080 SUPER，16 GB，计算能力 8.9 |
+| 系统 | Windows 下的 WSL2（Linux 6.6） |
+| 软件 | PyTorch 2.9.1（CUDA 12.8）、FlashInfer 0.7.0 |
+| 模型 | `Qwen/Qwen3-0.6B`，bfloat16 |
+| 代码 | 和上游 `main` 的 `9a91cfa` 一致 |
+
+`attention_backend` 默认是 `"auto"`，按计算能力选：10 及以上选 TensorRT-LLM（`"trtllm"`），9.x 选 prefill 用 FlashAttention、decode 用 FlashInfer 的组合（`"fa,fi"`），更低的选 FlashInfer（`"fi"`）。这张卡是 8.9，所以用的是 FlashInfer。换一张卡复现时，先确认选中的后端，见 <StageLink id="s7" />。
+
+文中用到三套配置：
+
+- **默认配置**：`LLM("Qwen/Qwen3-0.6B")`，所有参数用默认值。
+- **最小配置**：`LLM("Qwen/Qwen3-0.6B", attention_backend="fi", max_seq_len_override=4096, cuda_graph_max_bs=8, memory_ratio=0.5)`，占一半显存、启动快，适合单步调试。
+- **benchmark 配置**：<Src path="/benchmark/offline/bench.py" /> 里的参数：`max_seq_len_override=4096`、`max_extend_tokens=16384`、`cuda_graph_max_bs=256`、`page_size=256`。
+
+## 启动时间和第一个请求
+
+默认配置，prompt 是一条 20 个 token 的对话，生成 73 个 token。「冷启动」指这台机器上第一次运行，FlashInfer 需要现场编译 kernel；「热启动」指编译结果已经缓存在 `~/.cache/flashinfer` 之后。
+
+| | 冷启动 | 热启动 |
+| --- | --- | --- |
+| 创建 `LLM`（加载权重、分配 KV 池、录 CUDA graph） | 41.25 s | 5.78 s |
+| 第一次 `generate` | 13.23 s | 0.235 s |
+| 第二次 `generate`（同一个 prompt） | 0.208 s | 0.216 s |
+
+冷启动的日志里能看到 FlashInfer 编译了三个 JIT 模块：录 CUDA graph 的过程中编译了 `rope` 和 `silu_and_mul`，第一个请求的 prefill 又编译了 `batch_prefill_with_kv_cache`。加载权重本身只用了 1.5 s。所以服务刚部署好时，第一个请求慢是正常的，之后就快了。
+
+最小配置下热启动创建 `LLM` 用 5.04 s，第一次 `generate`（5 个 token 的 prompt，生成 16 个）用 0.086 s。
+
+## 显存
+
+默认配置启动时的日志：
+
+| 时刻 | 空闲显存 |
+| --- | --- |
+| 加载模型之前 | 14.67 GiB |
+| 引擎初始化结束（KV 池、`page_table`、attention 后端都已建好） | 0.85 GiB |
+| 录 CUDA graph 之前 | 0.82 GiB |
+| 录完 CUDA graph 之后 | 0.53 GiB |
+
+KV 池的大小由 `memory_ratio` 决定，每个 token 的 K 和 V 一共占 2 × 28 层 × 8 个 KV head × 128 维 × 2 字节 = 114,688 字节（112 KiB）：
+
+| 配置 | `memory_ratio` | `page_size` | KV 池的 token 数 | K + V 总大小 |
+| --- | --- | --- | --- | --- |
+| 默认配置 | 0.9（默认） | 1 | 112,081 | 11.97 GiB |
+| 最小配置 | 0.5 | 1 | 57,147 | 6.10 GiB |
+| benchmark 配置 | 0.9 | 256 | 111,872（437 页） | 11.95 GiB |
+
+默认配置下的几个张量形状：
+
+- `page_table` 和 `token_pool`：`[257, 40960]`。257 行是 `max_running_req` 的默认值 256，加上最后 1 行留给 CUDA graph 补齐用的 dummy 请求；40,960 列是模型的最大上下文长度和 KV 池大小中较小的那个，再向上对齐到 32 的倍数。
+- KV 缓冲区：`[2, 28, 112082, 1, 8, 128]`，依次是 K/V、层、页（多出的 1 页是 dummy 页）、页内 token、KV head、head 维度。
+
+这些数字的来龙去脉见 <StageLink id="s4" />。
+
+## CUDA graph
+
+| 配置 | 录制的 batch size |
+| --- | --- |
+| 默认配置 | 23 个：1、2、4、8，然后 16 到 160 每隔 8 一个 |
+| 最小配置（`cuda_graph_max_bs=8`） | 4 个：1、2、4、8 |
+| benchmark 配置（`cuda_graph_max_bs=256`） | 35 个：1、2、4、8，然后 16 到 256 每隔 8 一个 |
+
+默认配置下录这 23 个 graph 用掉约 0.29 GiB 显存。没有指定 `cuda_graph_max_bs` 时，加载模型之前的空闲显存超过 80 GB 就默认录到 256，否则录到 160。这张卡是 14.67 GiB，属于后者，见 <StageLink id="s7" />。
+
+## 前缀缓存
+
+最小配置，prompt 是 `"The capital of France is"`（5 个 token），贪心解码，`max_tokens=16`，同一个 `LLM` 连续生成 3 次：
+
+| 第几次 | radix 的输出 | radix 的 `evictable` | naive 的输出 | naive 的 `evictable` |
+| --- | --- | --- | --- | --- |
+| 1 | ` Paris. The capital of France is also the capital of the Republic of France.` | 20 | 同左 | 0 |
+| 2 | ` Paris. The capital of Italy is Rome. The capital of Spain is Madrid.` | 30 | ` Paris. The capital of France is also the capital of the Republic of France.` | 0 |
+| 3 | 同第 2 次 | 30 | 同第 2 次 | 0 |
+
+`evictable` 是前缀缓存里没被任何请求锁住、可以驱逐的 token 数。第 1 次之后是 20：5 个 prompt token 加 16 个输出 token，减去最后一个（它只被采样出来，从没作为输入算过 KV）。第 2 次命中了缓存，输出却变了，而 naive 模式三次完全一样，说明差别来自前缀缓存本身：命中之后 prefill 只算剩下的部分，计算的形状变了，bfloat16 下的数值随之有微小差异，贪心解码在某一步选了另一个 token。最后这一步是推断，没有逐层比对过。
+
+默认配置下用那条 20 个 token 的对话连续生成两次，`evictable` 从 93（20 + 73）涨到 166，第二次的输出同样和第一次不同。<StageLink id="s6" /> 会解释 `evictable` 的计算和驱逐规则。
+
+## Chunked prefill
+
+最小配置，把 `prefill_budget` 改成 16，送进一个 100 个 token 的 prompt。每一批的请求类型、`cached_len`、`extend_len`：
+
+```text
+[ChunkedReq, 0, 16]  [ChunkedReq, 16, 16]  [ChunkedReq, 32, 16]  [ChunkedReq, 48, 16]
+[ChunkedReq, 64, 16]  [ChunkedReq, 80, 16]  [Req, 96, 4]
+```
+
+## Overlap 模式下结束的请求
+
+只留 1 个表行（`max_running_req=1`），先让一个短请求以 EOS 结束，再让第二个请求复用这一行。完整脚本和解释见 <StageLink id="s5" hash="结束的请求还留下了两个问题" />。
+
+| | overlap 开 | overlap 关 |
+| --- | --- | --- |
+| 短请求的输出 | `'1\n'`：EOS 之后多出一个换行 | `'1'` |
+| 第二个请求的 prefill 在位置 27 读到的 token | 198（换行，被迟到的写入覆盖） | 100378（「电影」，prompt 原文） |
+| 第二个请求的译文 | `At 3 p.m. today, we met at the library entrance and then watched together.` | `At 3 p.m. today, we met at the library entrance and watched a movie together.` |
+
+把第二个请求换成 300 个随机 token 重复 5 次，开 overlap 时 5 次都是位置 27 被改成 198，关掉后 5 次都正常。
+
+再让短请求用 `ignore_eos=True` 按长度结束（prompt 长 25），第二个请求不变：
+
+| 短请求的 `max_tokens` | overlap 开：短请求收到的 `finished` | overlap 开：第二个请求的 prompt 被改写 | overlap 关 |
+| --- | --- | --- | --- |
+| 2 | 两条都是 True | 没有 | 只有最后一条是 True，prompt 没被改写 |
+| 3 | 后两条是 True | 位置 27 被改成 198，译文少了 movie | 同上 |
+| 4 | 后两条是 True | 位置 28 被改成 151643 | 同上 |
+
+被改写的位置等于 25 + `max_tokens` − 1，写进去的是短请求的最后一个 token。`max_tokens=3` 时短请求的离线输出也少了一个 token：开 overlap 是 `[16, 198]`，关掉是 `[16, 151645, 198]`，中间那个 EOS 带着早到的结束标志，被当成结尾的 EOS 丢掉了。
+
+服务模式（`python -m minisgl`，`--max-running-requests 4`、`--cuda-graph-max-bs 4`、`--memory-ratio 0.5`、`--max-seq-len-override 4096`），prompt 是 `"The capital of France is"`，贪心解码，`ignore_eos=true`：
+
+| `max_tokens` | overlap 开 | overlap 关 |
+| --- | --- | --- |
+| 1 | ` Paris`（1 段） | ` Paris`（1 段） |
+| 2 | ` Paris`（1 段） | ` Paris.`（2 段） |
+| 7 | ` Paris. The capital of Italy`（6 段） | ` Paris. The capital of Italy is`（7 段） |
+| 8 | ` Paris. The capital of Italy is`（7 段） | ` Paris. The capital of Italy is Rome`（8 段） |
+
+段数是 `/generate` 流式返回的 `data:` 行数；同样参数下非流式的 `/v1/chat/completions`（`temperature=0`）返回的文本和表里完全相同。
+
+## 吞吐
+
+<Src path="/benchmark/offline/bench.py" /> 的负载：256 个请求，prompt 长度在 100 到 1,024 之间随机，输出长度在 100 到 1,024 之间随机，`ignore_eos=True`，总共生成 133,966 个 token。三种设置各跑一次：
+
+| 设置 | 用时 | 吞吐 | 相对默认 |
+| --- | --- | --- | --- |
+| overlap 开，CUDA graph 开（默认） | 31.27 s | 4,285 token/s | |
+| overlap 关（`MINISGL_DISABLE_OVERLAP_SCHEDULING=1`） | 34.75 s | 3,855 token/s | 慢 10% |
+| CUDA graph 关（`cuda_graph_max_bs=0`） | 34.17 s | 3,920 token/s | 慢 8.5% |
+
+<Aside type="note">
+每组只跑了一次，重复运行会有几个百分点的波动。0.6B 的模型很小，每一步的 GPU 计算很短，CPU 调度和 kernel 发射的开销占比大，所以 overlap 和 CUDA graph 在这里的收益，会比在大模型上更明显。换成更大的模型时，收益会变小。这一点是推断，没有实测。
+</Aside>
+
+## 复现
+
+- 启动时间、显存和 CUDA graph：创建 `LLM` 时这些数字都会打在日志里。冷启动要先删掉 `~/.cache/flashinfer`。
+- 前缀缓存：生成之后读 `llm.cache_manager.prefix_cache.size_info.evictable_size`。
+- Chunked prefill：见 <StageLink id="s5" /> 的动手实验第 2 步。
+- Overlap 下结束的请求：离线部分见 <StageLink id="s5" /> 的动手实验第 3 步，服务模式见第 4 步。
+- 吞吐：直接跑 `python benchmark/offline/bench.py`；关 overlap 时加环境变量，关 CUDA graph 时把脚本里的 `cuda_graph_max_bs` 改成 0。

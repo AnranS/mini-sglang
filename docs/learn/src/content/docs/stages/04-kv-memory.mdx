@@ -1,0 +1,309 @@
+---
+title: 显存与 KV 池
+description: 显存怎么分给权重和 KV 池，一个 token 的 K/V 最终写进哪个地址。
+sidebar:
+  order: 4
+  label: 4 · 显存与 KV 池
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import Answer from '~/components/Answer.astro';
+import FileTable from '~/components/FileTable.astro';
+import Src from '~/components/Src.astro';
+import SrcCode from '~/components/SrcCode.astro';
+import StageHeader from '~/components/StageHeader.astro';
+import StageLink from '~/components/StageLink.astro';
+
+<StageHeader id="s4" />
+
+## 这一阶段要搞懂什么
+
+<StageLink id="s0" /> 讲了 KV cache 为什么要分页，<StageLink id="s3" /> 讲了模型怎么算出每一层的 K 和 V。这一章把两者接起来：启动时显存怎么在权重和 KV 池之间分配，KV 池长什么样，一个 token 的 K/V 由谁、在什么时候、写进池子里的哪个位置，以及调度器怎么记「哪些槽位是空的」。读完这一章，你应该能不看代码回答：
+
+- 默认的 `memory_ratio=0.9` 为什么在 RTX 4080 SUPER 上得到 112,081 个 token？
+- KV 缓冲区的页维为什么是 112,082，而不是 112,081？`page_size=256` 时为什么是 437 页？
+- `page_table` 里存的是什么？为什么不直接存页号？
+- `allocate_paged` 什么时候分配新页，一次分几页？
+- 写 KV 的 kernel 在哪里，谁在什么时候调用它？
+
+## 精读清单
+
+<FileTable files={[
+  { path: 'engine/engine.py', sym: 'Engine._determine_num_pages', note: '`model_memory` 是怎么测出来的，`memory_ratio` 乘的是什么' },
+  { path: 'engine/engine.py', sym: 'Engine.__init__', note: '从 KV cache initialization 读到 dummy 请求：`+1` 出现了两次' },
+  { path: 'kvcache/mha_pool.py', sym: 'MHAKVCache', note: '六维缓冲区，以及 `store_kv` 为什么要 `view`' },
+  { path: 'scheduler/cache.py', sym: 'CacheManager.allocate_paged', note: '`first_page` 和 `last_page` 为什么都向上取整' },
+  { path: 'scheduler/cache.py', sym: '_write_page_table', note: '一次写多少个位置，为什么写整页' },
+  { path: 'kernel/store.py', sym: 'store_cache', note: '`element_size` 是多少字节' },
+  { path: 'kernel/csrc/jit/store.cu', sym: 'store_kv_cache', note: '一个 warp 负责什么' },
+  { path: 'scheduler/cache.py', sym: 'CacheManager.check_integrity', note: '这个等式什么时候才成立' },
+]} />
+
+## 讲解
+
+### 显存怎么分：`_determine_num_pages`
+
+<SrcCode path="engine/engine.py" sym="Engine._determine_num_pages" mark={['model_memory = old_free_memory - new_free_memory', 'available_memory = int(config.memory_ratio * old_free_memory) - model_memory']} />
+
+它在权重加载完之后调用（见 <StageLink id="s3" /> 的 `Engine.__init__`），手上有两个数：`old_free_memory` 是加载模型**之前**的空闲显存，`new_free_memory` 是现在的空闲显存。计算分三步：
+
+1. `cache_per_page`：一页的 K 和 V 在所有层上一共占多少字节，等于 2 × `head_dim` × 本卡的 KV head 数 × `page_size` × 每个元素的字节数 × 层数。多卡时 KV head 按卡数切分（<StageLink id="s9" />）。
+2. `model_memory`：两次空闲显存之差，也就是加载模型这一步实际吃掉的显存。它不只是权重本身，这两次测量之间发生的所有分配都算在里面。
+3. `available_memory = memory_ratio × old_free_memory − model_memory`，整除 `cache_per_page` 就是页数。设了 `num_page_override` 时跳过这一步，直接用给定的页数。
+
+所以 `memory_ratio` 乘的是**加载模型之前的空闲显存**，不是显卡的总显存；权重也要从这一份里出。每次测量前 <Src path="engine/engine.py" sym="Engine._sync_get_memory" /> 都会先 `synchronize` 和 `empty_cache`，把 PyTorch 缓存着但没在用的显存还回去，量到的才是真正的空闲量。
+
+### 把实测的数字串起来
+
+Qwen3-0.6B 的 `head_dim` 为 128、KV head 8 个、28 层，bfloat16 每个元素 2 字节。`page_size=1` 时：
+
+```text
+cache_per_page = 2 × 128 × 8 × 1 × 2 × 28 = 114,688 字节（112 KiB）
+```
+
+在 RTX 4080 SUPER 上用默认参数启动，日志里加载模型之前的空闲显存是 14.67 GiB，KV 池有 112,081 个 token（数字见[实测记录](../../appendix/measurements/)）。日志没有打印 `model_memory`，但可以反推：
+
+- `num_pages = 112,081`，说明 `available_memory` 落在 112,081 × 114,688 = 12,854,345,728 字节和 112,082 × 114,688 = 12,854,460,416 字节之间，约 11.97 GiB。
+- 0.9 × 14.67 GiB ≈ 13.20 GiB，减去 11.97 GiB，`model_memory` 约为 1.23 GiB。14.67 是四舍五入到两位小数的，所以这个数只能精确到 0.01 GiB 左右。
+
+1.23 GiB 里有哪些东西？权重本身可以数出来：Qwen3-0.6B 共享 embedding 和 LM head 之后，模型里有 596,049,920 个参数，bfloat16 下是 1,192,099,840 字节，约 1.11 GiB；构造模型时还在 GPU 上建了一张 `[40960, 128]` 的 float32 RoPE 表，约 20 MiB（<StageLink id="s3" />）。两者加起来约 1.13 GiB，剩下的约 0.1 GiB 从日志里分不出来。可能是加载过程中 CUDA 在 PyTorch 分配器之外占用的显存，这一点是推测，没有逐项核实。
+
+**最小配置能不能对上？** `memory_ratio=0.5` 时，0.5 × 14.67 − 1.23 ≈ 6.10 GiB，除以 112 KiB 约是 57,100 多个 token，和实测的 57,147 个、6.10 GiB 对得上。那次启动的加载前空闲显存没有单独记录，这里假设和默认配置那次相同。
+
+**KV 池分完之后还剩多少？** 把公式代进去：剩余 = `old_free_memory` − `model_memory` − KV 池 ≈ `old_free_memory` − `model_memory` − (0.9 × `old_free_memory` − `model_memory`) = 0.1 × `old_free_memory`。`model_memory` 被消掉了：**不管模型多大，KV 池分完之后剩下的总是加载前空闲显存的 1 − `memory_ratio`**，这里约是 1.47 GiB。严格说还要加上整除丢掉的不到一页、减去下面要讲的 dummy 页，`page_size=1` 时两者都不到 112 KiB。page_table、attention 后端的 workspace、CUDA graph、前向时的激活都要从这 1.47 GiB 里出。
+
+<Aside type="note" title="实测里的 0.85 GiB 还没完全解释">
+日志里「分配完 KV 池之后」的 0.85 GiB，是在 <Src path="engine/engine.py" sym="Engine.__init__" text="post_free_memory = self._sync_get_memory()[0]" label="post_free_memory" /> 这一行测的，这时 page_table 和 attention 后端也已经建好了。能从代码里数出来的是：page_table 为 257 × 40,960 × 4 字节，约 40 MiB；FlashInfer 后端的 `float_workspace_buffer` 为 128 MiB。1.47 GiB 减去这两项约是 1.30 GiB，比 0.85 GiB 多出约 0.45 GiB，这部分去了哪里没有核实。之后「录 CUDA graph 之前」降到 0.82 GiB，差的 0.03 GiB 和录图用的 `[160, 40960]` int32 页表缓冲区（约 25 MiB）大致对得上，这也是估算。动手实验第 2 步请你自己把它查清楚。
+</Aside>
+
+### KV 池的形状和那一个 dummy 页
+
+<SrcCode path="engine/engine.py" sym="Engine.__init__" from="# ======================= KV cache initialization" to="self.page_table[self.dummy_req.table_idx].fill_(num_tokens)" mark={['num_pages=self.num_pages + 1,  # +1 for dummy page', '(config.max_running_req + 1, aligned_max_seq_len),', 'self.page_table[self.dummy_req.table_idx].fill_(num_tokens)']} />
+
+<SrcCode path="kvcache/mha_pool.py" sym="MHAKVCache.__init__" />
+
+KV 池就是一个六维的大张量，依次是 K/V、层、页、页内 token、KV head、head 维度。默认配置下它是 `[2, 28, 112082, 1, 8, 128]`。
+
+页维之所以是 112,082，是因为 `create_kvcache_pool` 收到的是 `num_pages + 1`，多出来的一页是 **dummy 页**。它是给 CUDA graph 补齐用的 dummy 请求准备的（<StageLink id="s7" />）：dummy 请求也要跑完整的前向，也要写 K/V，总得有个地方让它写，又不能写到真实请求的槽位上。
+
+dummy 页怎么保证不被真实请求拿走？看调度器这边：`CacheManager` 收到的是 `engine.num_pages`，也就是 112,081，空闲列表里只有 0 到 112,080 这些页，dummy 页（编号 112,081）从来不在里面。dummy 请求用的是 `page_table` 的最后一行（`table_idx=config.max_running_req`），整行填成 `num_tokens`，也就是 dummy 页第一个槽位的位置。dummy 页不在 `memory_ratio` 的预算之内，`page_size=1` 时只多占 112 KiB。
+
+### `page_size=256`：为什么是 437 页
+
+benchmark 配置用 `page_size=256`。这时：
+
+```text
+cache_per_page = 114,688 × 256 = 29,360,128 字节（28 MiB）
+```
+
+把上面反推出的 `available_memory`（12,854,345,728 到 12,854,460,416 字节之间）代进去，除以 29,360,128 得 437.8，整除后是 **437 页**，也就是 437 × 256 = 111,872 个 token，K + V 共 437 × 28 MiB ≈ 11.95 GiB，和实测记录一致（那次启动的空闲显存也没有单独记录，这里同样假设相同）。KV 缓冲区的形状就是 `[2, 28, 438, 256, 8, 128]`。
+
+比 `page_size=1` 时少了 209 个 token：整除只能按整页丢，最多丢掉不到一页。`page_size` 大了还有别的代价：每个请求最后一页通常用不满，调度器预留空间时每个 decode 请求还要多留 `page_size − 1` 个 token（<StageLink id="s5" /> 的 `inflight_tokens`），dummy 页也变成了 28 MiB。选 TensorRT-LLM 后端时，`page_size` 不是 16、32、64 之一会被强制改成 64，见 <Src path="engine/engine.py" sym="_adjust_config" />。
+
+### `page_table` 存的是 token 的物理位置
+
+`page_table` 的形状是 `[max_running_req + 1, aligned_max_seq_len]`，默认配置下是 `[257, 40960]`：
+
+- 行：每个正在运行的请求一行，最后一行留给 dummy 请求。
+- 列：请求内的第几个 token。列数是 `min(max_seq_len, num_tokens)` 向上对齐到 32 的倍数：一个请求再长也不会超过整个 KV 池，而 32 个 int32 正好 128 字节，这是注释里「aligned to 128 bytes」的意思。默认配置下 `max_seq_len` 是模型的 `max_position_embeddings`，40,960 已经是 32 的倍数。
+
+`page_table[行, j]` 的值是这个请求第 j 个 token 的 K/V 在池子里的**物理位置**，也就是「页号 × `page_size` + 页内偏移」。代码注释里的「store raw locations instead of pages」说的就是这件事，`Context` 里也写着「this table always treat page_size = 1」。
+
+举个例子，`page_size=4`，一个 6 个 token 的请求分到了页起点为 12 和 28 的两页：
+
+| 请求内的位置 j | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `page_table[行, j]` | 12 | 13 | 14 | 15 | 28 | 29 | 30 | 31 |
+
+位置 6、7 还没有 token，但所在的页已经分给了这个请求，位置也已经写好了，接下来 decode 的两步直接用。
+
+为什么存物理位置而不是页号？因为这样**写 KV 和读 KV 都不用关心 `page_size`**：
+
+- 写：新 token 要写到哪里，直接查表就是 `out_loc`，写 KV 的 kernel 把池子看成一个 `[num_pages × page_size, KV head, head_dim]` 的扁平数组，按位置寻址。
+- 读：FlashInfer 后端把每层的缓存 `view` 成页大小为 1 的形状（<Src path="attention/fi.py" sym="FlashInferBackend.forward" text="def _flatten_cache" label="_flatten_cache" />），把 `page_table` 这一行的前 `device_len` 个值直接当作页号传给它，所以 `FIMetadata` 里的 `page_size` 恒为 1，而 benchmark 配置照样能用 `page_size=256`。
+- 确实需要页号的后端自己换算。TensorRT-LLM 后端每隔 `page_size` 列取一个值，再整除 `page_size`：
+
+<SrcCode path="attention/trtllm.py" sym="TensorRTLLMBackend.prepare_metadata" from="page_table = get_global_ctx().page_table" to="new_page_table.div_" />
+
+上面的例子里，取第 0 列和第 4 列得到 12、28，整除 4 得到页号 3、7。
+
+`page_table` 旁边还有一张形状相同的 `token_pool`，存的是 token id，不是位置，<StageLink id="s2" /> 讲过，两者不要混淆。
+
+### `allocate_paged`：按页分配
+
+<SrcCode path="scheduler/cache.py" sym="CacheManager.allocate_paged" />
+
+每一批在 `_prepare_batch` 里调用一次（<StageLink id="s5" />），给这一批每个请求这次要写的位置 `[cached_len, device_len)` 准备好槽位：
+
+- `first_page = ceil(cached_len / page_size)`：`cached_len` 所在的那一页如果只写了一部分，说明它早就分配过了，从下一页开始算。
+- `last_page = ceil(device_len / page_size)`：要覆盖到 `device_len − 1` 所在的那一页。
+- 两者之差就是这个请求要新分配的页数。整批的页数加在一起，一次性从空闲列表里取出来。
+
+例：`page_size=4`，`cached_len=5`，`device_len=9`，这次要写位置 5 到 8。`first_page = 2`，`last_page = 3`，只新分配 1 页，覆盖位置 8 到 11；位置 5 到 7 在第 1 页里，上次就分配好了。`page_size=1` 时公式退化成「每个新 token 分一个槽位」。
+
+<SrcCode path="scheduler/cache.py" sym="CacheManager._allocate" />
+
+`free_slots` 是一个 GPU 上的 int32 张量，存的是**空闲页的起点位置**，初值是 `arange(num_pages) * page_size`，也就是 0、4、8……（`page_size=4` 时）。`_allocate` 从头部取，不够时先让前缀缓存驱逐一部分（<StageLink id="s6" />）。驱逐返回的是逐 token 的位置，所以要用 `[:: page_size]` 取出每页的起点再放回空闲列表；释放时 `_free` 也是这样做的。
+
+<SrcCode path="scheduler/cache.py" sym="_write_page_table" />
+
+`_page_to_token` 把页起点展开成逐 token 的位置，`_write_page_table` 再把它们写进 `page_table`：在 pinned memory 里拼出每个位置的「行号、列号」，非阻塞地拷上 GPU，然后一次高级索引赋值全部写完。它写的是**整页**的列（`first_page × page_size` 到 `last_page × page_size`），所以上面例子里的位置 9 到 11 也提前填好了。
+
+分配完之后，`_prepare_batch` 用 `page_table[input_mapping]` 查出 `out_loc`：这一批每个输入 token 的 K/V 要写到哪个位置。
+
+### 写 KV 的 kernel
+
+K/V 的写入不在模型代码里，也不在 attention kernel 里，而是由 attention 后端在每一层 `forward` 的开头单独做一次。以 FlashInfer 后端为例：
+
+<SrcCode path="attention/fi.py" sym="FlashInferBackend.forward" mark="self.kvcache.store_kv(k, v, batch.out_loc, layer_id)" />
+
+FlashAttention 后端（<Src path="attention/fa.py" sym="FlashAttentionBackend.forward" />）和 TensorRT-LLM 后端（<Src path="attention/trtllm.py" sym="TensorRTLLMBackend.forward" />）的第一步也是同一行 `store_kv`。先写后读，而且在同一个 stream 上，所以紧接着的 attention 读到的历史里已经包含了这一批的新 token。每次前向要写 28 次，每层一次。
+
+<SrcCode path="kvcache/mha_pool.py" sym="MHAKVCache.store_kv" />
+
+<SrcCode path="kernel/store.py" sym="store_cache" />
+
+`MHAKVCache.store_kv` 取出第 `layer_id` 层的 K、V 缓冲区，`view` 成 `[num_pages × page_size, 8, 128]` 的扁平形状，交给 `store_cache`。`store_cache` 再把每个位置看成一行 `element_size` 字节：对 Qwen3-0.6B 是 8 × 128 × 2 = 2,048 字节。`element_size` 是 kernel 的模板参数，第一次遇到时 JIT 编译一个模块，`functools.cache` 缓存起来（JIT 的机制见 <StageLink id="s10" />）。
+
+<SrcCode path="kernel/csrc/jit/store.cu" sym="store_kv_cache" />
+
+kernel 本身很简单：**一个 warp 负责一个 token**，读出这个 token 的目标位置 `pos = indices[warp_id]`，把 K 的 2,048 字节拷到 `k_cache + pos × stride`，V 同理。每个 block 128 个线程，也就是 4 个 warp，一个 block 处理 4 个 token。`indices` 可以是 int32 或 int64，`out_loc` 是 int32。
+
+传进来的 `k`、`v` 其实是 `qkv_proj` 输出的**视图**（<StageLink id="s3" />），每行之间隔着 4,096 个元素，不是连续的。host 端的 `TensorMatcher` 把输入的行距 `Y` 读出来传给 kernel，所以不用先 `contiguous()` 拷一份。
+
+`out_loc` 从哪来，在 CUDA graph 下还要多说一句：replay 时 `out_loc` 会先拷进录图用的固定缓冲区（<Src path="engine/graph.py" sym="GraphCaptureBuffer.copy_from" />），graph 里的这个 kernel 读的是那块缓冲区（<StageLink id="s7" />）。正常调度出来的 batch 里，补齐用的 dummy 请求的 `out_loc` 查自 `page_table` 的最后一行，全是 `num_tokens`，都写在 dummy 页的第一个槽位上，写了什么无所谓，没有人会读。
+
+### `CacheManager` 的账：空闲、可驱逐、受保护
+
+<SrcCode path="scheduler/cache.py" sym="CacheManager.available_size" />
+
+任何时刻，KV 池里真实的 `num_pages × page_size` 个槽位都属于下面四类中的一类：
+
+| 类别 | 在哪里记账 | 能不能分给新请求 |
+| --- | --- | --- |
+| 空闲 | `free_slots` | 能 |
+| 可驱逐 | 前缀缓存里没人锁住的部分，`evictable_size` | 能，先驱逐 |
+| 受保护 | 前缀缓存里被正在运行的请求锁住的部分，`protected_size` | 不能 |
+| 请求私有 | 分给了正在运行的请求、还没插进前缀缓存的部分，哪里都不记 | 不能 |
+
+`available_size` 就是前两类之和，准入控制拿它来判断放不放得下（<StageLink id="s5" />）。请求命中前缀后 `lock`，那一段从「可驱逐」挪到「受保护」；请求结束时 `cache_req` 把能插进树的部分交给前缀缓存、解锁，剩下的尾巴还回 `free_slots`。前缀树里怎么加锁、怎么驱逐，是 <StageLink id="s6" /> 的内容。
+
+<SrcCode path="scheduler/cache.py" sym="CacheManager.check_integrity" />
+
+`check_integrity` 检查的是「空闲页数 + 前缀缓存占的页数 = 总页数」，也就是假设第四类「请求私有」为零。所以它只有在没有请求运行时才成立。调用它的只有 <Src path="scheduler/scheduler.py" sym="Scheduler.run_when_idle" />：服务模式下，调度器手上没活、准备阻塞等新消息之前调用一次（<Src path="scheduler/io.py" sym="SchedulerIOMixin._recv_msg_single_rank" />）。离线的 `LLM` 走的是 `offline_receive_msg`，不会调用它，想检查要自己调。`page_size > 1` 时它还检查空闲列表里每个值都是 `page_size` 的倍数。它调用的 `prefix_cache.check_integrity()` 在 radix 和 naive 两种实现里都是空的，见 <StageLink id="s6" />。
+
+## 常见误区
+
+- **「`memory_ratio=0.9` 就是把显卡的 90% 给 KV 池」**：乘的是加载模型之前的空闲显存，而且权重也要从这一份里扣。16 GB 的卡上 KV 池拿到的是 11.97 GiB。
+- **「`page_table` 存的是页号」**：存的是每个 token 的物理位置。`page_size=1` 时两者恰好相同，所以很容易误会。需要页号的后端自己取每页第一列再整除。
+- **「dummy 页也是池子里的一页，可能被分给请求」**：它在 `num_pages` 之外，`free_slots` 里从来没有它。
+- **「K/V 是 attention kernel 顺手写进缓存的」**：mini-sglang 里是后端在每层开头单独调用 `store_kv`，用自己的 JIT kernel 写，然后才调用 attention。
+- **「`page_size` 越大越省显存」**：每个 token 占的字节数不变；页越大，整除丢掉的、每个请求最后一页用不满的、调度器为每个请求多预留的，都越多。
+
+## 自测题
+
+1. 按代码的公式，说明默认配置下为什么得到 112,081 个 token。`model_memory` 大约是多少，是怎么测出来的？
+
+   <Answer>
+   `num_pages = (0.9 × old_free_memory − model_memory) // cache_per_page`，`cache_per_page` 为 114,688 字节。`model_memory` 是加载模型前后两次空闲显存之差。日志给出加载前 14.67 GiB，0.9 倍约 13.20 GiB；112,081 个 token 对应约 11.97 GiB，反推 `model_memory` 约 1.23 GiB，其中权重约 1.11 GiB、RoPE 表约 20 MiB，其余约 0.1 GiB 从日志里分不出来。
+   </Answer>
+
+2. 换一个大一倍的模型，`memory_ratio` 不变，KV 池分完之后剩下的空闲显存会变吗？
+
+   <Answer>
+   基本不变。剩余 = `old_free_memory` − `model_memory` − (`memory_ratio` × `old_free_memory` − `model_memory`) = (1 − `memory_ratio`) × `old_free_memory`，`model_memory` 被消掉了（忽略整除丢掉的不到一页和 dummy 页）。变的是 KV 池：模型越大，KV 池越小。
+   </Answer>
+
+3. KV 缓冲区的页维为什么是 112,082？dummy 请求那一行 `page_table` 填的是什么值，为什么？
+
+   <Answer>
+   `create_kvcache_pool` 收到的是 `num_pages + 1`，多出的一页是 dummy 页。dummy 请求的那一行整行填 `num_tokens`（这里是 112,081），这是 dummy 页第一个槽位的物理位置，所以 dummy 请求的 K/V 都写进 dummy 页，不会碰到真实请求的数据。`CacheManager` 只管理前 `num_pages` 页，dummy 页永远不会被分配出去。
+   </Answer>
+
+4. `page_size=256` 时为什么是 437 页？为什么 token 数比 `page_size=1` 时少？
+
+   <Answer>
+   `cache_per_page` 变成 114,688 × 256 = 29,360,128 字节。可用字节数和 `page_size=1` 时一样（约 12,854,4xx,xxx 字节），除下来是 437.8，整除得 437 页，即 111,872 个 token。少的 209 个是整除时丢掉的不到一页。这里假设两次启动的空闲显存相同。
+   </Answer>
+
+5. `page_size=4`，一个请求 `cached_len=8`、`device_len=9`，`allocate_paged` 会分配几页？如果 `cached_len=9`、`device_len=10` 呢？
+
+   <Answer>
+   第一种：`first_page = ceil(8/4) = 2`，`last_page = ceil(9/4) = 3`，分配 1 页，覆盖位置 8 到 11。第二种：`first_page = ceil(9/4) = 3`，`last_page = ceil(10/4) = 3`，不分配，位置 9 在上一次分配的那页里，`page_table` 里早就写好了。
+   </Answer>
+
+6. 为什么 `page_table` 存物理位置而不是页号？FlashInfer 后端和 TensorRT-LLM 后端分别怎么用它？
+
+   <Answer>
+   存物理位置后，写 KV 时 `out_loc` 直接查表，kernel 把池子当扁平数组寻址，不用关心 `page_size`。FlashInfer 后端把缓存 `view` 成页大小为 1，把 `page_table` 一行的前 `device_len` 个值直接当页号用，所以 `FIMetadata.page_size` 恒为 1。TensorRT-LLM 后端需要真正的页号，每隔 `page_size` 列取一个值再整除 `page_size`。
+   </Answer>
+
+7. 写 KV 的 kernel 在哪里？谁调用它？一次前向调用几次？
+
+   <Answer>
+   CUDA 代码在 `kernel/csrc/jit/store.cu` 的 `store_kv_cache`，Python 入口是 `kernel/store.py` 的 `store_cache`，由 `MHAKVCache.store_kv` 调用。三个 attention 后端的 `forward` 开头都会调用 `self.kvcache.store_kv(k, v, batch.out_loc, layer_id)`，每层一次，Qwen3-0.6B 一次前向调用 28 次。
+   </Answer>
+
+8. 进阶：为什么 `check_integrity` 只能在调度器空闲时调用？请求运行时，它的等式差在哪里？
+
+   <Answer>
+   它检查的是「空闲页 + 前缀缓存占的页 = 总页数」。请求运行时，分给它、还没插进前缀缓存的那部分槽位既不在 `free_slots` 里，也不在 `evictable_size` 或 `protected_size` 里，等式左边会少掉这一部分。只有所有请求都结束、它们的 KV 要么进了前缀树、要么还回了空闲列表之后，等式才成立，所以它只在 `run_when_idle` 里调用，也就是服务模式下调度器准备阻塞等消息的时候。
+   </Answer>
+
+## 动手实验
+
+<Steps>
+
+1. **手算，再对日志。** 用 <StageLink id="s1" /> 的最小配置启动，在日志里找到 `Free memory before loading model` 和 `Allocating ... tokens for KV cache` 这两行。按本章的公式反推 `model_memory`，再预测把 `memory_ratio` 改成 0.3 时会分到多少个 token，改了之后跑一次验证。
+
+2. **找出那 0.45 GiB。** 在 `Engine.__init__` 里，每一步之后都打印一次空闲显存：
+
+   ```python
+   logger.info_rank0(f"after <这一步的名字>: {mem_GB(self._sync_get_memory()[1])}")
+   ```
+
+   分别加在 `create_kvcache_pool`、创建 `page_table`、`create_attention_backend`、创建 `Sampler` 之后。观察每一步各用掉多少，把本章 Aside 里没解释清楚的那部分找出来。
+
+3. **看 `page_table` 里到底存了什么。** 用 `page_size=4` 同时跑两个请求：
+
+   ```python
+   from minisgl.core import SamplingParams
+   from minisgl.llm import LLM
+
+   llm = LLM(
+       "Qwen/Qwen3-0.6B",
+       attention_backend="fi",
+       max_seq_len_override=4096,
+       cuda_graph_max_bs=8,
+       memory_ratio=0.5,
+       page_size=4,
+   )
+   a = list(range(1000, 1006))  # 6 个 token
+   b = list(range(2000, 2003))  # 3 个 token
+   llm.generate([a, b], SamplingParams(max_tokens=8, ignore_eos=True))
+   print(llm.engine.page_table[255, :16].tolist())  # 第一个请求拿到的表行
+   print(llm.engine.page_table[254, :16].tolist())
+   cm = llm.cache_manager
+   print(len(cm.free_slots), cm.prefix_cache.size_info, cm.num_pages)
+   cm.check_integrity()
+   llm.shutdown()
+   ```
+
+   先想清楚：`TableManager` 用 `pop()` 分表行，为什么第一个请求拿到的是第 255 行？然后按 `allocate_paged` 的规则，一步一步推出这两行的 16 列应该是什么（prefill 时两个请求一起分配，之后每步 decode 按 `uid` 顺序分配；哪些列从来没被分配过？），再和打印结果对照。最后一行打印的三个数应该满足什么关系？
+
+4. **看每一层写到了哪里。** 在 `MHAKVCache.store_kv` 开头加上：
+
+   ```python
+   if layer_id == 0 and not torch.cuda.is_current_stream_capturing():
+       print("out_loc:", out_loc.tolist())
+   ```
+
+   录 CUDA graph 的时候不能做 `.tolist()` 这种需要同步的操作，所以要排除正在录图的情况。先用 `cuda_graph_max_bs=8` 启动，观察启动时（录图前那次预热前向）打印出来的 `out_loc` 是什么值。它们指向 dummy 页吗？到 `GraphRunner._capture_graphs` 和 `GraphCaptureBuffer` 里找原因，再想想这样做为什么无害。然后改成 `cuda_graph_max_bs=0` 跑第 3 步的两个请求，把每一批的 `out_loc` 和第 3 步打印的 `page_table` 对照起来。
+
+</Steps>
+
+## 过关标准
+
+- 能不看代码写出 `_determine_num_pages` 的公式，并用它解释 112,081、112,082 和 437 这三个数。
+- 能画出 `page_table` 一行的内容，说明它存的是物理位置，以及 `allocate_paged` 在什么时候分配新页。
+- 能说出一个 token 的 K/V 从 `qkv_proj` 的输出到写进 KV 池，经过了哪几个函数和哪个 kernel。

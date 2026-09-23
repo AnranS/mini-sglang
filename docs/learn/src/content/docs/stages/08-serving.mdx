@@ -1,0 +1,352 @@
+---
+title: 多进程服务化
+description: API server、tokenizer、scheduler 怎么启动、怎么用 ZeroMQ 传消息、怎么取消请求。
+sidebar:
+  order: 8
+  label: 8 · 多进程服务化
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import Answer from '~/components/Answer.astro';
+import FileTable from '~/components/FileTable.astro';
+import Mermaid from '~/components/Mermaid.astro';
+import Src from '~/components/Src.astro';
+import SrcCode from '~/components/SrcCode.astro';
+import StageHeader from '~/components/StageHeader.astro';
+import StageLink from '~/components/StageLink.astro';
+
+<StageHeader id="s8" />
+
+## 这一阶段要搞懂什么
+
+前面几章都在单进程的 `LLM` 里打转：分词、调度、前向、反分词都在同一个 Python 进程里，一个函数调用接一个函数调用。`python -m minisgl` 启动的服务则是另一副样子：HTTP 请求由 API server 进程接收，分词和反分词在单独的进程里做，每张卡一个调度器进程，彼此之间用 ZeroMQ 传消息。调度器的核心逻辑一行没变，变的是它的输入从哪来、输出到哪去。读完这一章，你应该能不看代码回答：
+
+- 默认配置下一共起了几个进程？`--num-tokenizer` 设成 0 和设成 2 有什么区别？
+- 一个流式请求从 HTTP 进来，到最后一个 token 返回，经过了哪几个进程、哪几条 ZeroMQ 队列、哪几种消息？
+- 一条消息是怎么变成字节、又怎么变回 dataclass 的？
+- 客户端断开连接后，取消请求要走哪几跳？为什么 overlap 模式下取消会和请求结束撞车？
+- 前端给每个请求建的 `ack_map`、`event_map` 条目，什么时候删？
+
+## 精读清单
+
+<FileTable files={[
+  { path: 'server/launch.py', sym: 'launch_server', note: '起了哪些进程，每个进程拿到什么地址，为什么要等 ack' },
+  { path: 'server/args.py', sym: 'ServerArgs', note: '五个 ZeroMQ 地址，谁 bind、谁 connect 由 `share_tokenizer` 决定' },
+  { path: 'message/utils.py', sym: 'serialize_type', note: '消息怎么变成 msgpack 能打包的字典，张量怎么处理' },
+  { path: 'tokenizer/server.py', sym: 'tokenize_worker', note: '一个进程同时处理三种消息，各发到哪里' },
+  { path: 'scheduler/io.py', sym: 'SchedulerIOMixin', note: '调度器的收发，单卡和多卡各用哪一对函数' },
+  { path: 'server/api_server.py', sym: 'FrontendManager', note: '`ack_map` 和 `event_map` 在哪里建、在哪里删' },
+  { path: 'tokenizer/detokenize.py', sym: 'DetokenizeManager.detokenize', note: '增量文本怎么算，`DecodeStatus` 什么时候删' },
+  { path: 'scheduler/scheduler.py', sym: 'Scheduler._process_one_msg', note: '取消消息到了调度器之后做什么' },
+]} />
+
+## 讲解
+
+### 起了哪些进程
+
+入口是 <Src path="server/launch.py" sym="launch_server" />。它先解析参数，然后把「启动后端」这件事包成一个回调交给 `run_api_server`，自己所在的主进程就是 API server：
+
+<SrcCode path="server/launch.py" sym="launch_server.start_subprocess" />
+
+数一数：
+
+1. **每个 TP rank 一个调度器进程**，名字是 `minisgl-TP{i}-scheduler`。每个进程拿到的 `ServerArgs` 只有 `tp_info` 不同。rank `i` 用第 `i` 张卡，这一点在 <Src path="engine/engine.py" sym="Engine.__init__" text="cuda:{config.tp_info.rank}" label="Engine.__init__" /> 里。
+2. **一个反分词器进程**（detokenizer），永远只有一个。
+3. **`num_tokenizer` 个分词器进程**。默认值是 0，意思不是「不分词」，而是「不单独起分词器」：`ServerArgs.share_tokenizer` 为真，分词和反分词由上面那一个进程一起做。所以默认配置、单卡时，一共是 3 个进程：API server、调度器、tokenizer 兼 detokenizer。
+4. 主进程自己，运行 FastAPI 和 uvicorn。
+
+几个细节：
+
+- 子进程用 `spawn` 方式启动，不继承父进程的 CUDA 状态。<Src path="engine/engine.py" sym="Engine.__init__" text="assert not torch.cuda.is_initialized()" label="Engine.__init__ 开头" /> 就断言 CUDA 还没初始化。
+- 主进程靠一个 `mp.Queue` 等所有子进程报到，一共等 `num_tokenizers + 2` 条：只有 rank 0 的调度器发 ack，而且是在 <Src path="server/launch.py" sym="_run_scheduler" text="scheduler.sync_all_ranks()" label="sync_all_ranks" /> 之后发，这时所有 rank 都已经初始化完。全部到齐后才打印「API server is ready」并启动 uvicorn，保证第一个 HTTP 请求进来时后端都在。
+- 进程之间的地址是 `ipc:///tmp/minisgl_N.pid=...` 形式的 Unix 域套接字，后缀是主进程的 pid（<Src path="scheduler/config.py" sym="_get_pid_suffix" />）。`dataclasses.replace` 会把这个字段原样复制给每个子进程，所以大家算出来的地址一致；同一台机器上起两个服务也不会撞地址。
+- `torch.distributed` 的初始化地址是另一回事：`tcp://127.0.0.1:{server_port + 1}`，默认端口 1919，所以是 1920（<Src path="server/args.py" sym="ServerArgs.distributed_addr" />）。多卡之间怎么用它，见 <StageLink id="s9" />。
+
+### 五条 ZeroMQ 队列
+
+所有队列都封装在 <Src path="utils/mp.py" /> 里：PUSH / PULL 一对用于点对点，PUB / SUB 一对用于广播，调度器用同步版本，API server 用 `zmq.asyncio` 的异步版本。地址定义在 <Src path="scheduler/config.py" sym="SchedulerConfig" /> 和 <Src path="server/args.py" sym="ServerArgs" /> 里：
+
+| 地址 | 方向 | 谁 bind | 走的消息 |
+| --- | --- | --- | --- |
+| `minisgl_0` | tokenizer 进程到调度器 rank 0 | 调度器 rank 0 | `UserMsg`、`AbortBackendMsg`，多条时包成 `BatchBackendMsg` |
+| `minisgl_1` | 调度器 rank 0 到 detokenizer | 默认是 detokenizer；`num_tokenizer > 0` 时是调度器 | `DetokenizeMsg`，多条时包成 `BatchTokenizerMsg`。默认配置下 API server 的 `TokenizeMsg`、`AbortMsg` 也发到这里 |
+| `minisgl_2` | 调度器 rank 0 广播给其他 rank | 调度器 rank 0 | 从 `minisgl_0` 收到的原始字节，只在多卡时存在 |
+| `minisgl_3` | tokenizer 进程到 API server | API server | `UserReply`，多条时包成 `BatchFrontendMsg` |
+| `minisgl_4` | API server 到分词器 | API server | `TokenizeMsg`、`AbortMsg`，只在 `num_tokenizer > 0` 时存在 |
+
+`share_tokenizer` 同时决定了第 2 行和第 5 行：共享时 <Src path="server/args.py" sym="ServerArgs.zmq_tokenizer_addr" /> 直接返回 detokenizer 的地址，于是 API server 和调度器都往同一个 PULL 套接字里推，由那一个进程绑定；不共享时，API server 绑定 `minisgl_4`，多个分词器 connect 上来，ZeroMQ 的 PUSH 会把消息轮流分给它们，分词就这样并行起来了。反分词只有一个进程，因为每个请求的增量解码状态（下面的 `DecodeStatus`）只存在一个地方。
+
+调度器这一侧的收发在 `SchedulerIOMixin` 的构造函数里接好：
+
+<SrcCode path="scheduler/io.py" sym="SchedulerIOMixin.__init__" />
+
+- 离线模式（`LLM`）直接换成 `offline_receive_msg` / `offline_send_result`，完全不建套接字，所以 <StageLink id="s1" /> 里可以在一个进程里单步调试。
+- 只有 rank 0 连 tokenizer。多卡时 rank 0 收到消息后再用 PUB 转发给其他 rank；其他 rank 的 `send_result` 什么也不做，结果只由 rank 0 发回。rank 之间怎么保证收到同样的消息，见 <StageLink id="s9" />。
+
+### 消息和序列化
+
+消息都是普通的 dataclass，按接收方分在三个文件里：发给调度器的在 <Src path="message/backend.py" />，发给 tokenizer 进程的在 <Src path="message/tokenizer.py" />，发给 API server 的在 <Src path="message/frontend.py" />。每个文件有一个基类，基类的 `encoder` / `decoder` 负责转换：
+
+<SrcCode path="message/utils.py" sym="serialize_type" />
+
+- 普通对象变成一个字典：`__type__` 记类名，其余是各字段，递归处理。然后 <Src path="utils/mp.py" sym="ZmqPushQueue.put" /> 用 msgpack 打包成字节发出去。
+- 张量只支持一维，存成原始字节加上 dtype 字符串。`UserMsg.input_ids` 就是这样传过去的，接收方用 `np.frombuffer` 还原后再 `copy()` 一份。
+- 反序列化按 `__type__` 在**基类所在模块的 `globals()`** 里查类（<Src path="message/utils.py" sym="deserialize_type" />）。所以 `BaseBackendMsg.decoder` 只能还原 `backend.py` 里能看到的名字。`UserMsg` 里嵌套的 `SamplingParams` 能被还原，是因为 `backend.py` 顶上 import 了它。
+
+每一步 decode，调度器给每个请求发一条 `DetokenizeMsg`，里面只有 `uid`、一个 token id 和 `finished`。消息很小，但条数和 token 数一样多，这是多进程带来的固定开销之一。
+
+### 一个流式请求的一生
+
+下面是默认配置（`num_tokenizer=0`）下，一个 `stream=true` 的 `/v1/chat/completions` 请求的全过程。多卡时多出的那一段用 `opt` 框出来。
+
+<Mermaid
+  caption="默认配置下一个流式请求的全过程。tokenizer 和 detokenizer 是同一个进程，所以 API server 和调度器都往 minisgl_1 推消息。图比较宽，可以左右滚动。"
+  code={`sequenceDiagram
+    autonumber
+    participant C as 客户端
+    participant F as API server<br/>（主进程）
+    participant T as tokenizer 兼<br/>detokenizer 进程
+    participant S0 as 调度器<br/>rank 0
+    participant S1 as 调度器<br/>rank 1 到 N-1
+    C->>F: POST /v1/chat/completions<br/>stream=true
+    Note over F: new_user() 分配 uid<br/>建 ack_map[uid] 和 event_map[uid]
+    F->>T: TokenizeMsg<br/>PUSH 到 minisgl_1
+    Note over T: apply_chat_template<br/>再 encode 成 int32 张量
+    T->>S0: UserMsg<br/>PUSH 到 minisgl_0
+    opt tp_size 大于 1
+        S0->>S1: 原始字节<br/>PUB 到 minisgl_2
+        S0-->>S1: 这一轮的消息条数<br/>gloo broadcast
+    end
+    loop 每生成一个 token
+        Note over S0,S1: 各自调度、前向<br/>层间 NCCL all-reduce
+        S0->>T: DetokenizeMsg<br/>（多条时是 BatchTokenizerMsg）<br/>PUSH 到 minisgl_1
+        Note over T: DetokenizeManager<br/>算出增量文本
+        T->>F: UserReply<br/>（多条时是 BatchFrontendMsg）<br/>PUSH 到 minisgl_3
+        Note over F: listen() 追加进 ack_map[uid]<br/>event.set()
+        F-->>C: 一个 SSE 数据块
+    end
+    Note over S0: 采到 EOS 或到达 max_tokens<br/>finished=True
+    F-->>C: finish_reason 块<br/>然后 data: [DONE]`}
+/>
+
+对照代码逐跳看：
+
+1. <Src path="server/api_server.py" sym="v1_completions" /> 调 `new_user()` 拿到一个自增的 `uid`，同时建好这个 uid 的回复列表和 `asyncio.Event`，然后发出 `TokenizeMsg`。`uid` 由 API server 分配，后面所有进程都用它认请求。
+2. tokenizer 进程的主循环 <Src path="tokenizer/server.py" sym="tokenize_worker" /> 把收到的消息按类型分成三堆：`DetokenizeMsg` 去反分词后发给 API server；`TokenizeMsg` 分词后变成 `UserMsg` 发给调度器；`AbortMsg` 原样换成 `AbortBackendMsg` 发给调度器。chat 请求的 `text` 是消息列表，<Src path="tokenizer/tokenize.py" sym="TokenizeManager.tokenize" /> 先套 chat template 再编码。
+3. 调度器在每一轮开头的 `receive_msg` 里收到 `UserMsg`，交给 `_process_one_msg` 放进 prefill 队列。从这里到采样出 token，就是 <StageLink id="s5" /> 讲的全部内容。
+4. 每一轮收尾时，`_process_last_data` 给这一批的每个请求生成一条 `DetokenizeMsg`，由 <Src path="scheduler/io.py" sym="SchedulerIOMixin._reply_tokenizer_rank0" /> 一次发出，多条时打包成一条 `BatchTokenizerMsg`，省得每条都过一次套接字。
+5. 反分词得到的增量文本包成 `UserReply` 发给 API server。API server 的 `listen` 协程把它追加进 `ack_map[uid]`，并 set 对应的 event。
+6. 等在这个 event 上的 `wait_for_ack` 醒过来，把攒下的回复逐条交给 `stream_chat_completions`，后者拼成 OpenAI 格式的 SSE 块，经 `stream_with_cancellation` 交给 `StreamingResponse` 写回客户端。
+
+### 反分词：增量文本怎么算
+
+<SrcCode path="tokenizer/detokenize.py" sym="DetokenizeManager.detokenize" mark={['if msg.uid not in self.decode_map:', 'del self.decode_map[msg.uid]']} />
+
+一个 token 不一定对应完整的字符：中文、emoji 常常要两三个 token 才能拼出一个字。所以不能每来一个 token 就单独解码。`DecodeStatus` 为每个请求记住已经收到的 token 和几个偏移量，每次把「上次确认过的位置之后」的 token 一起解码，减去之前那段的解码结果，得到新增的文本；结尾是 `�`（半个字符）时先扣着不发。这个算法来自 SGLang 和 HF transformers 的 streamer。
+
+记住下面三点，后面要用：
+
+- 不认识的 uid，**直接新建**一个 `DecodeStatus`。
+- 只有 `finished` 为真的消息才会删掉这个 uid 的状态。
+- 以 EOS 结束时，EOS 本身不加进 `decoded_ids`，所以返回的文本里没有它。
+
+### API server：`FrontendManager`
+
+<SrcCode path="server/api_server.py" sym="FrontendManager.listen" />
+
+<SrcCode path="server/api_server.py" sym="FrontendManager.wait_for_ack" mark={['del self.ack_map[uid]', 'del self.event_map[uid]']} />
+
+- `listen` 是一个后台协程，在第一次发消息时由 `_create_listener_once` 创建。放到这里而不是构造函数里，是因为构造 `FrontendManager` 时 uvicorn 的事件循环还没跑起来。
+- `listen` 收到 uid 不在 `ack_map` 里的回复直接丢掉。这是给取消用的：被取消的请求，uid 已经从 `ack_map` 删掉了，调度器那边迟到的回复会被静默丢弃。
+- `wait_for_ack` 是一个异步生成器：等 event、清 event、把攒下的回复取走并逐条 yield，遇到 `finished` 就结束，最后删掉这个 uid 的两个条目。
+
+对外的接口：
+
+- `POST /generate`：输入是纯文本 prompt，总是流式返回，每块是 `data: 增量文本` 加一个换行。采样参数只有 `max_tokens` 和 `ignore_eos`，`SamplingParams` 的温度默认 0，也就是贪心解码。
+- `POST /v1/chat/completions`：OpenAI 兼容，`messages` 和 `prompt` 二选一，支持 `stream`、`temperature`、`top_k`、`top_p`、`max_tokens`、`ignore_eos`。请求模型里的 `n`、`stop`、两个 penalty 字段会被接收但不起作用（代码里标着 TODO）。返回的 `usage` 全是 0，`finish_reason` 永远是 `"stop"`。
+- `GET /v1/models` 和 `/v1`：返回模型名和状态，让 OpenAI 客户端能连上。
+
+### 前端状态的泄漏：`del` 永远执行不到
+
+回头看 `wait_for_ack` 最后两行 `del`。它们要执行，生成器得自己走到 `if ack and ack.finished: break`。可是三个消费者都是这样写的：
+
+<SrcCode path="server/api_server.py" sym="FrontendManager.stream_generate" mark={['if ack.finished:']} />
+
+消费者拿到 `finished` 的那条回复，自己先 `break` 了。这时生成器停在 `yield ack` 上，再也不会被恢复。`async for` 被 `break` 打断时不会关闭生成器；等它被垃圾回收，asyncio 会调用它的 `aclose()`，在 `yield` 处抛出 `GeneratorExit`。两行 `del` 在循环后面，不在 `finally` 里，照样被跳过。
+
+受影响的不只是流式请求：`stream_chat_completions` 和非流式的 `v1_completions` 也都是读到 `finished` 就 `break`。所以**每一个正常结束的请求**都会在 `ack_map` 和 `event_map` 里留下一个条目，服务跑得越久，两个字典越大。只有被取消的请求例外，因为 `abort_user` 自己会删。
+
+上游 PR [#151](https://github.com/sgl-project/mini-sglang/pull/151)（写作时还开着）的修法是把清理挪到 yield 终止回复**之前**：在循环里发现 `ack.finished` 时先 `del` 两个条目，再 `yield`，然后直接 `return`。这样不管消费者恢复不恢复生成器，状态都已经清掉了。
+
+「读到第一条 `finished` 就结束」还会放大调度器那边的一个问题。overlap 模式下，以 `max_tokens` 结束的请求会连着收到两条 `finished=True` 的回复，第一条挂在倒数第二个 token 上（<StageLink id="s5" hash="结束的请求还留下了两个问题" />）。前端读到第一条就结束响应，最后一个 token 到不了客户端，实测 `max_tokens=8` 只拿回 7 个。PR #151 合并后也一样，那条回复只是改成在 `listen` 里被丢弃，要修得改调度器。
+
+### 取消请求
+
+取消只在流式请求上有。`/generate` 和流式的 chat 都把生成器包在 `stream_with_cancellation` 里：
+
+<SrcCode path="server/api_server.py" sym="FrontendManager.stream_with_cancellation" />
+
+<SrcCode path="server/api_server.py" sym="FrontendManager.abort_user" />
+
+一次取消要走这几跳：
+
+1. 客户端断开。发现的途径有两种：每发一个块之前检查 `request.is_disconnected()`，或者 Starlette 在检测到断开后取消正在写响应的任务，生成器在 `await` 处收到 `CancelledError`。两种都落进 `except`。
+2. 另起一个任务跑 `abort_user`。它先等 0.1 秒，再删掉 `ack_map` 和 `event_map` 里的条目，然后发一条 `AbortMsg`。代码没有说明为什么要等这 0.1 秒。
+3. tokenizer 进程把它换成 `AbortBackendMsg` 发给调度器 rank 0；多卡时和其他消息一样广播给所有 rank。
+4. 调度器处理它：
+
+<SrcCode path="scheduler/scheduler.py" sym="Scheduler._process_one_msg" from="elif isinstance(msg, AbortBackendMsg):" to="self._free_req_resources(req_to_free)" />
+
+- 先在 prefill 等待队列里找。找到了就从队列里拿掉；如果它正在做 chunked prefill，返回那个 `ChunkedReq`，需要释放资源；还没开始算的请求没占任何资源，返回 None。
+- 再在 decode 集合里找，找到就移出集合。
+- 找到了就 `_free_req_resources`：还回表行，把 KV 交给前缀缓存。
+- 调度器不回任何消息。detokenizer 从来不知道这个请求被取消了，它的 `DecodeStatus` 如果已经建了，就永远留在 `decode_map` 里。
+
+非流式请求没有取消路径：客户端断开后，请求照样算到结束，结果被丢掉（其实也没丢掉，见上一节，它留在了 `ack_map` 里）。
+
+<Aside type="note" title="多个分词器时，取消可能跑到请求前面">
+`num_tokenizer > 0` 时，`TokenizeMsg` 和随后的 `AbortMsg` 可能被 PUSH 轮流分给两个不同的分词器进程，它们各自发往调度器，到达顺序没有保证。如果取消先到，调度器什么也找不到，随后到的 `UserMsg` 会被当成新请求一直算到结束。这是从代码推出来的，没有实际复现过；客户端要在分词完成之前就断开才会碰上。
+</Aside>
+
+### 取消撞上结束：PR #111 讲的竞争
+
+在 <StageLink id="s5" /> 的 overlap 模式下，一个请求可能**一边在 GPU 上算最后一步，一边被取消**。设请求 R 在第 j 批采到了 EOS，客户端恰好在这时断开：
+
+| 轮次 | 收消息 | 发射 | 收尾 |
+| --- | --- | --- | --- |
+| j | | 第 j 批，R 在里面，GPU 给 R 采到 EOS | 第 j−1 批 |
+| j+1 | 收到 R 的 `AbortBackendMsg`：R 还在 decode 集合里（CPU 还不知道 EOS），移出并 `_free_req_resources(R)` | 第 j+1 批，R 不在里面；新请求可能拿到 R 刚还回的表行 | 第 j 批：R 采到了 EOS，`finished` 为真，而 R **不在** `finished_reqs` 里，于是再 `_free_req_resources(R)` 一次 |
+
+`finished_reqs` 只防「overlap 多算一步」造成的重复释放，取消路径释放的请求不会被记进去，所以挡不住。重复释放的后果：
+
+- 同一个表行被 `table_manager.free` 两次，空闲列表里出现两份，之后可能同时分给两个请求。
+- `cache_req(finished=True)` 被调两次。在 radix 缓存下，第二次会对同一个旧 handle 再解锁一次：如果它命中过前缀、而且那段前缀没有别的请求锁着，引用计数会减到负数，触发 <Src path="kvcache/radix_cache.py" sym="RadixPrefixCache.lock_handle" text="assert node.ref_count >= 0" label="lock_handle 里的断言" />，调度器进程直接崩溃；有别的请求锁着时则不报错，只是计数悄悄错了。第二次插入还会发现整段前缀都在树里，把刚挂上树的那些页当作「重复的部分」再放回空闲列表，同一页既在树里又在空闲列表里。naive 缓存下则是整行的 KV 页被释放两次。
+
+同一个窗口里还有一种不结束的情况：R 在第 j 批做的是 prefill。第 j+1 轮取消先释放了它，收尾时 R 没结束，又走到 `cache_req(req, finished=False)`，对已经解锁的 handle 再解锁一次，并锁上一个再也不会被解锁的新 handle。另外，取消释放的表行在 R 那一批还没算完时就可能被新请求拿走，这和 s5 讲的「迟到的写入」是同一类问题。
+
+这些都只在 overlap 模式下发生：`normal_loop` 每一轮收消息时，上一批已经收尾完毕，没有「在飞」的批次。
+
+上游 PR [#111](https://github.com/sgl-project/mini-sglang/pull/111)（写作时还开着）的修法：收到取消时只把请求从两个队列里移出，不释放资源，记进 `pending_aborts`；等本轮 `_process_last_data` 之后再统一释放，跳过已经在 `finished_reqs` 里的（已经被收尾释放过了），也跳过还在当前这一批里的。
+
+### Shell 模式
+
+`python -m minisgl --model ... --shell` 或者 `python -m minisgl.shell --model ...` 启动交互式终端。`--shell` 能用是因为 argparse 默认允许参数名缩写，它匹配的是 `--shell-mode`。后端和服务模式完全一样，只是主进程不跑 uvicorn，而是跑一个 `prompt_toolkit` 的输入循环，把历史对话拼成 messages 直接调 `shell_completion`，不经过 HTTP。
+
+<SrcCode path="server/args.py" sym="parse_args" from="run_shell |= kwargs.pop" to='kwargs["silent_output"] = True' />
+
+在 shell 模式下，这三行强制把 `cuda_graph_max_bs` 和 `max_running_req` 设成 1，并打开 `silent_output`。代码没有注释，合理的解释是：终端里同一时间只有一个人、一个请求，表只要一行，CUDA graph 也不用录那么多。`cuda_graph_max_bs=1` 时照样会录 1、2、4 这三个写死的大小，省掉的是从 8 开始的那些，录制时间和显存都省下来了；`silent_output` 让调度器进程关掉 INFO 日志（<Src path="server/launch.py" sym="_run_scheduler" text="logging.disable(logging.INFO)" label="_run_scheduler" />），免得日志冲掉屏幕上的对话。
+
+<SrcCode path="server/api_server.py" sym="shell_completion" from="async def _abort():" to="background=BackgroundTask(lambda: _abort)," mark="background=BackgroundTask(lambda: _abort)," />
+
+这里的取消其实从来不会执行，原因有两层：`shell()` 直接遍历 `body_iterator`，不经过 ASGI，`StreamingResponse` 的后台任务根本不会被调度；就算被调度，`lambda: _abort` 返回的是函数对象本身，没有调用它。好在 shell 里每一轮都是等上一轮生成完才发下一轮，不取消也没有实际影响，只是每一轮都在 `ack_map` 里留一个条目。
+
+## 常见误区
+
+- **「默认配置下 tokenizer 和 detokenizer 是两个进程」**：`num_tokenizer` 默认 0，表示分词和反分词共用一个进程。设成 N 时才会多出 N 个分词器，detokenizer 始终只有一个。
+- **「多卡时每个 rank 都把结果发回前端」**：只有 rank 0 连着 tokenizer 进程，其他 rank 的 `send_result` 是空函数。
+- **「非流式请求在函数返回时就清理了自己的状态」**：没有。它和流式请求一样读到 `finished` 就 `break`，`wait_for_ack` 里的 `del` 执行不到。
+- **「客户端一断开，GPU 上的计算马上就停」**：要经过 0.1 秒的等待和 API server、tokenizer 进程、调度器三跳，调度器在下一轮收消息时才处理；已经在 GPU 上的那一批照样算完。非流式请求则根本不会被取消。
+- **「服务模式的调度逻辑和 `LLM` 不一样」**：`LLM` 就是 `Scheduler` 的子类，只是换掉了收发两个函数。调度、前向、收尾的代码完全相同。
+
+## 自测题
+
+1. `--tp-size 2`、其余参数默认时，一共有几个进程？主进程要等几条 ack？为什么调度器只有 rank 0 发 ack？
+
+   <Answer>
+   4 个：API server 主进程、2 个调度器、1 个 tokenizer 兼 detokenizer（`num_tokenizer=0`）。主进程等 `num_tokenizers + 2 = 2` 条：rank 0 调度器一条、tokenizer 进程一条。rank 0 在 `sync_all_ranks()` 这个屏障之后才发 ack，它发出时所有 rank 都已经初始化完，一条就够了。（用 `spawn` 启动时 multiprocessing 还可能多起一个自己的辅助进程，那不属于 mini-sglang。）
+   </Answer>
+
+2. `num_tokenizer=0` 和 `num_tokenizer=2` 时，`minisgl_1` 分别由谁 bind？API server 的 `TokenizeMsg` 发到哪个地址？
+
+   <Answer>
+   为 0 时 `share_tokenizer` 为真，唯一的 tokenizer 进程 bind `minisgl_1`，调度器 rank 0 和 API server 都 connect 到它，`TokenizeMsg` 也发到 `minisgl_1`。为 2 时调度器 rank 0 bind `minisgl_1`，detokenizer connect；API server bind `minisgl_4`，两个分词器 connect，`TokenizeMsg` 发到 `minisgl_4`，由 PUSH 轮流分给两个分词器。
+   </Answer>
+
+3. `UserMsg` 里嵌着一个 `SamplingParams`，接收方怎么知道要还原成哪个类？如果在 `message/backend.py` 里删掉 `from minisgl.core import SamplingParams` 会怎样？
+
+   <Answer>
+   序列化时每个对象都带着 `__type__`，值是类名；`deserialize_type` 在基类所在模块的 `globals()` 里按名字查类。`SamplingParams` 能被找到，是因为 `backend.py` import 了它。删掉这行 import 后（假设类型标注不再需要它），调度器收到 `UserMsg` 时查 `cls_map["SamplingParams"]` 会抛 `KeyError`。
+   </Answer>
+
+4. 哪些请求能被取消？分别从哪里发起？
+
+   <Answer>
+   只有经过 `stream_with_cancellation` 的请求：`/generate` 和 `stream=true` 的 `/v1/chat/completions`。客户端断开后，由 `is_disconnected()` 检查或者 `CancelledError` 触发 `abort_user`。非流式请求没有取消路径。shell 模式虽然写了 `BackgroundTask`，但既不会被调度，`lambda: _abort` 也没有调用 `_abort`，所以同样不会取消。
+   </Answer>
+
+5. 为什么 `wait_for_ack` 最后的两行 `del` 在正常结束时执行不到？PR #151 为什么要把清理挪到 yield 之前，而不是简单地包一层 `try` / `finally`？
+
+   <Answer>
+   消费者读到 `finished` 的回复就 `break`，生成器停在 `yield ack`，不会再走到自己的 `break` 和后面的 `del`。包成 `finally` 在理论上也能清理：生成器被回收时 `aclose()` 会触发 `finally`。但那要等垃圾回收，时机不确定，而且依赖 asyncio 的异步生成器钩子。在 yield 终止回复之前就删掉，清理和消费者的行为完全无关，是确定的。
+   </Answer>
+
+6. overlap 模式下，一个请求在采到 EOS 的同一时刻被取消，为什么会被释放两次？`normal_loop` 下为什么不会？
+
+   <Answer>
+   overlap 模式下 CPU 领先 GPU 一拍：下一轮开头收到取消时，CPU 还不知道 R 已经采到 EOS，R 还在 decode 集合里，取消路径把它释放了一次。同一轮稍后 `_process_last_data` 处理上一批，看到 R 的 EOS，而 R 不在 `finished_reqs` 里（取消路径不往里记），于是又释放一次。`normal_loop` 在同一轮里就处理完当前批的结果，下一轮收消息时没有在飞的批次，结束的请求早已不在任何队列里，取消找不到它。
+   </Answer>
+
+7. detokenizer 的 `decode_map` 里，哪些 uid 的状态永远不会被删？
+
+   <Answer>
+   `DecodeStatus` 只在收到 `finished=True` 的消息时删除，不认识的 uid 又会直接新建。所以：被取消的请求（调度器不会再给它发 `finished` 的消息，detokenizer 也收不到取消通知）；以及下一题说的、overlap 多算一步之后才到的那条消息所新建的状态。
+   </Answer>
+
+8. 进阶：<StageLink id="s5" hash="结束的请求还留下了两个问题" /> 讲过，overlap 模式下一个以 EOS 结束的请求会多算一步，多发出一条 `DetokenizeMsg`。在服务模式下，这条消息最后去了哪里？流式和非流式请求有区别吗？PR #151 合并以后呢？
+
+   <Answer>
+   逐跳看：
+
+   1. 调度器：第 j+1 轮收尾时 R 已经结束、状态已经释放；第 j+2 轮收尾处理多算的那一批，R 在 `finished_reqs` 里，跳过释放，但照样生成一条 `DetokenizeMsg`。它的 `finished` 通常是 False；只有多算的那一步恰好到达 `max_tokens`，或者又采到一次 EOS 时才是 True。
+   2. detokenizer：R 的 `DecodeStatus` 已经在上一条 `finished=True` 的消息时删掉了，这条消息的 uid 不认识，于是新建一个，把多出来的 token 解码成文本发给 API server。`finished` 为 False 时，这个新建的状态永远不会被删。
+   3. API server：`listen` 只丢弃 uid 不在 `ack_map` 里的回复。按当前代码，**流式和非流式请求都一样**：两者都是读到 `finished` 就 `break`，`del` 执行不到，uid 还在 `ack_map` 里。于是这条回复被追加进 `ack_map[uid]`，event 被 set，但已经没有人等这个 event，它就一直挂在那里。客户端看不到这个多出来的 token，代价是两份泄漏的状态上又多了一条回复。
+   4. PR #151 合并后，uid 在 yield 终止回复之前就被删掉，这条回复会在 `listen` 里被丢弃。detokenizer 那边新建的 `DecodeStatus` 仍然会泄漏，PR #151 管不到它。
+
+   一个极少见的例外：如果终止回复和多出来的回复在 API server 的事件循环醒来之前都已经追加进了 `ack_map[uid]`，它们会被同一次 `wait_for_ack` 一起取走，多出来的那条被取走但没被 yield，`ack_map[uid]` 里留下的是空列表。
+   </Answer>
+
+## 动手实验
+
+<Steps>
+
+1. **数进程、看套接字。** 用默认参数启动服务：
+
+   ```bash
+   python -m minisgl --model Qwen/Qwen3-0.6B
+   ```
+
+   等日志出现「API server is ready」后，另开一个终端，用 `pstree -p $(pgrep -f "minisgl --model" | head -1)` 看子进程，用 `ls /tmp/minisgl_*` 看 ipc 套接字文件。先预测有哪几个地址，再对照上面的表。然后加上 `--num-tokenizer 2` 重启，观察多出了哪个地址、多了几个子进程。
+
+2. **看流式输出的每一块。** 发一个流式请求，`-N` 关掉 curl 的缓冲：
+
+   ```bash
+   curl -N http://127.0.0.1:1919/v1/chat/completions \
+     -H 'Content-Type: application/json' \
+     -d '{"model": "qwen", "stream": true, "max_tokens": 64,
+          "messages": [{"role": "user", "content": "用一句话介绍北京。"}]}'
+   ```
+
+   观察：有没有 `content` 为空、只有 `role` 的块？中文是一个字一块还是几个字一块？最后两块是什么？再用 `/generate` 发同一个问题，比较两种接口的输出格式。
+
+3. **亲眼看到泄漏。** 在 `server/api_server.py` 里其他路由旁边加一个调试接口：
+
+   ```python
+   @app.get("/debug/state")
+   async def debug_state():
+       state = get_global_state()
+       return {str(uid): len(replies) for uid, replies in state.ack_map.items()}
+   ```
+
+   重启服务，发 3 个非流式、3 个流式的短问题（例如「1+1 等于几？只回答数字。」，`max_tokens` 设大一点，确保它们以 EOS 结束），然后访问 `/debug/state`。如果上面的分析正确，6 个 uid 都还在，而且每个后面通常挂着 1 条没人读的回复。再加上环境变量 `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` 重启重做一遍，观察这个数字变成多少。最后按 PR #151 的思路改 `wait_for_ack`（在 yield 终止回复之前删掉两个条目，yield 之后直接 `return`），确认字典变空。
+
+4. **跟踪一次取消。** 在 `Scheduler._process_one_msg` 的 `AbortBackendMsg` 分支里打印 `msg.uid`，以及请求是在 prefill 队列还是 decode 集合里找到的。然后发一个会生成很久的流式请求，用 `curl --max-time 2` 让它两秒后断开，观察 API server 打出的是「Client disconnected」还是只有「Aborting request」，以及调度器那边的打印。再用非流式请求做同样的事，确认调度器没有收到取消。
+
+   挑战：PR #111 的竞争很难靠手动断开来碰上。读一读那个 PR 里的单元测试，看它怎么用 mock 的 `Engine` 构造出「同一轮里既取消又结束」的场景，然后在不看它的修复的前提下自己改 `Scheduler`，让测试通过。
+
+</Steps>
+
+## 过关标准
+
+- 能不看代码画出一个流式请求的时序图，标出每一跳的进程、ZeroMQ 地址和消息类型，并说出 `num_tokenizer` 改成非零后哪几跳会变。
+- 能说出取消请求的完整路径，以及 overlap 模式下「取消撞上结束」为什么会导致重复释放。
+- 能解释为什么每个正常结束的请求都会在 `ack_map` 里留下条目，以及 overlap 多算一步的那条回复最后落在了哪里。

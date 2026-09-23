@@ -1,0 +1,835 @@
+/* ---------------------------------------------------------------------------
+ * Theme: Mini-SGLang orange, CJK-friendly fonts
+ * ------------------------------------------------------------------------- */
+
+:root {
+	--sl-font: system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei',
+		'Noto Sans CJK SC', 'Source Han Sans SC', sans-serif;
+	--sl-font-mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+	--sl-color-accent-low: hsl(20, 42%, 17%);
+	--sl-color-accent: hsl(21, 80%, 56%);
+	--sl-color-accent-high: hsl(26, 95%, 84%);
+	--ml-radius: 0.5rem;
+	--ml-ok: var(--sl-color-green);
+	--ml-doing: var(--sl-color-orange);
+}
+
+:root[data-theme='light'] {
+	--sl-color-accent-low: hsl(25, 90%, 92%);
+	--sl-color-accent: hsl(19, 76%, 45%);
+	--sl-color-accent-high: hsl(16, 72%, 27%);
+}
+
+.sr-only {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	white-space: nowrap;
+	border: 0;
+}
+
+.num {
+	text-align: right;
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------------------
+ * Source references
+ * ------------------------------------------------------------------------- */
+
+a.src-ref {
+	text-decoration: none;
+	white-space: nowrap;
+}
+
+a.src-ref code {
+	color: var(--sl-color-text-accent);
+	background: var(--sl-color-bg-inline-code);
+	border-radius: 0.25rem;
+	padding: 0.1em 0.35em;
+	font-size: 0.875em;
+	overflow-wrap: anywhere;
+	white-space: normal;
+}
+
+a.src-ref:hover code {
+	text-decoration: underline;
+	text-underline-offset: 0.2em;
+}
+
+.src-ref-loc {
+	margin-inline-start: 0.3em;
+	font-family: var(--sl-font-mono);
+	font-size: 0.75em;
+	color: var(--sl-color-gray-3);
+}
+
+.src-code {
+	margin-top: 1rem;
+}
+
+.src-code .expressive-code {
+	margin-top: 0 !important;
+}
+
+.src-code-link {
+	display: block;
+	margin-top: 0.35rem !important;
+	text-align: right;
+	font-size: var(--sl-text-xs);
+	color: var(--sl-color-gray-3);
+	text-decoration: none;
+}
+
+.src-code-link:hover {
+	color: var(--sl-color-text-accent);
+}
+
+/* ---------------------------------------------------------------------------
+ * Diagrams
+ * ------------------------------------------------------------------------- */
+
+figure.diagram {
+	margin: 1.5rem 0;
+	overflow-x: auto;
+}
+
+figure.diagram pre.mermaid {
+	margin: 0;
+	padding: 1rem;
+	border: 1px solid var(--sl-color-hairline-light);
+	border-radius: var(--ml-radius);
+	background: transparent;
+	text-align: center;
+	font-size: var(--sl-text-xs);
+	line-height: 1.5;
+}
+
+figure.diagram pre.mermaid:not([data-rendered]) {
+	white-space: pre;
+	text-align: start;
+	color: var(--sl-color-gray-3);
+	min-height: 6rem;
+}
+
+figure.diagram pre.mermaid[data-rendered='true'] {
+	white-space: normal;
+}
+
+/* Wide diagrams shrink to fit, but never below 80% of their natural size;
+   past that the frame scrolls so the labels stay readable. */
+figure.diagram pre.mermaid[data-rendered='true'] {
+	overflow-x: auto;
+}
+
+figure.diagram pre.mermaid svg {
+	width: max(100%, calc(var(--natural-width, 0px) * 0.8));
+	height: auto;
+}
+
+figure.diagram figcaption {
+	margin-top: 0.5rem;
+	text-align: center;
+	font-size: var(--sl-text-sm);
+	color: var(--sl-color-gray-3);
+}
+
+/* ---------------------------------------------------------------------------
+ * Timeline (CPU / GPU lanes)
+ * ------------------------------------------------------------------------- */
+
+figure.timeline {
+	margin: 1.5rem 0;
+	padding: 1rem 1rem 0.75rem;
+	border: 1px solid var(--sl-color-hairline-light);
+	border-radius: var(--ml-radius);
+	overflow-x: auto;
+}
+
+.timeline-group + .timeline-group {
+	margin-top: 1rem;
+}
+
+.timeline-title {
+	margin: 0 0 0.4rem;
+	font-family: var(--sl-font-mono);
+	font-size: var(--sl-text-sm);
+	color: var(--sl-color-white);
+}
+
+.timeline-row {
+	display: grid;
+	grid-template-columns: 2.75rem minmax(28rem, 1fr);
+	align-items: center;
+	gap: 0.5rem;
+}
+
+.timeline-row + .timeline-row {
+	margin-top: 0.3rem;
+}
+
+.timeline-label {
+	font-size: var(--sl-text-xs);
+	font-weight: 600;
+	color: var(--sl-color-gray-3);
+	text-align: end;
+}
+
+.timeline-track {
+	position: relative;
+	height: 1.9rem;
+	border-radius: 0.3rem;
+	background: repeating-linear-gradient(
+		to right,
+		var(--sl-color-gray-6) 0,
+		var(--sl-color-gray-6) calc(100% / var(--span) - 1px),
+		var(--sl-color-hairline-light) calc(100% / var(--span) - 1px),
+		var(--sl-color-hairline-light) calc(100% / var(--span))
+	);
+}
+
+.timeline-block,
+.timeline-swatch {
+	border: 1px solid transparent;
+	border-radius: 0.3rem;
+}
+
+.timeline-block {
+	position: absolute;
+	top: 0.15rem;
+	bottom: 0.15rem;
+	left: calc(var(--at) / var(--span) * 100%);
+	width: calc(var(--len) / var(--span) * 100%);
+	display: grid;
+	place-items: center;
+	overflow: hidden;
+	padding: 0 0.25rem;
+	font-size: var(--sl-text-xs);
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+
+.timeline [data-kind='schedule'] {
+	border-color: var(--sl-color-accent);
+	background: var(--sl-color-accent-low);
+	color: var(--sl-color-accent-high);
+}
+
+.timeline [data-kind='finish'] {
+	border-color: var(--sl-color-green);
+	background: var(--sl-color-green-low);
+	color: var(--sl-color-green-high);
+}
+
+.timeline [data-kind='gpu'] {
+	border-color: var(--sl-color-blue);
+	background: var(--sl-color-blue-low);
+	color: var(--sl-color-blue-high);
+}
+
+.timeline [data-kind='wait'] {
+	border-color: var(--sl-color-gray-4);
+	border-style: dashed;
+	color: var(--sl-color-gray-3);
+}
+
+.timeline [data-kind='idle'] {
+	border-color: var(--sl-color-red);
+	border-style: dashed;
+	background: var(--sl-color-red-low);
+	color: var(--sl-color-red-high);
+}
+
+.timeline-legend {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.25rem 1rem;
+	margin: 0.75rem 0 0;
+	padding: 0;
+	list-style: none;
+	font-size: var(--sl-text-xs);
+	color: var(--sl-color-gray-3);
+}
+
+.timeline-legend li {
+	display: flex;
+	align-items: center;
+	gap: 0.35rem;
+}
+
+.timeline-swatch {
+	display: inline-block;
+	width: 0.9rem;
+	height: 0.7rem;
+}
+
+figure.timeline figcaption {
+	margin-top: 0.5rem;
+	font-size: var(--sl-text-sm);
+	color: var(--sl-color-gray-3);
+}
+
+/* ---------------------------------------------------------------------------
+ * Self-check answers
+ * ------------------------------------------------------------------------- */
+
+details.answer {
+	margin-top: 0.5rem;
+	border-inline-start: 3px solid var(--sl-color-accent);
+	padding-inline-start: 0.9rem;
+}
+
+details.answer > summary {
+	cursor: pointer;
+	font-size: var(--sl-text-sm);
+	font-weight: 600;
+	color: var(--sl-color-text-accent);
+	width: fit-content;
+}
+
+details.answer > summary:hover {
+	text-decoration: underline;
+}
+
+details.answer[open] > summary {
+	margin-bottom: 0.4rem;
+}
+
+details.answer .answer-body > :first-child {
+	margin-top: 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Stage header and progress control
+ * ------------------------------------------------------------------------- */
+
+.stage-header {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 0.75rem 1.5rem;
+	padding: 0.75rem 1rem;
+	margin-bottom: 1.5rem;
+	border: 1px solid var(--sl-color-hairline-light);
+	border-radius: var(--ml-radius);
+	background: var(--sl-color-bg-nav);
+	font-size: var(--sl-text-sm);
+}
+
+.stage-meta {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.5rem 0.75rem;
+	color: var(--sl-color-gray-2);
+}
+
+.stage-chip {
+	padding: 0.1rem 0.55rem;
+	border-radius: 999px;
+	background: var(--sl-color-accent-low);
+	color: var(--sl-color-text-accent);
+	font-weight: 600;
+	white-space: nowrap;
+}
+
+.stage-prereq a {
+	color: var(--sl-color-text-accent);
+}
+
+.stage-status {
+	display: inline-flex;
+	border: 1px solid var(--sl-color-gray-5);
+	border-radius: 999px;
+	overflow: hidden;
+}
+
+.stage-status-option {
+	all: unset;
+	cursor: pointer;
+	padding: 0.2rem 0.8rem;
+	font-size: var(--sl-text-xs);
+	color: var(--sl-color-gray-2);
+}
+
+.stage-status-option + .stage-status-option {
+	border-inline-start: 1px solid var(--sl-color-gray-5);
+}
+
+.stage-status-option:hover {
+	background: var(--sl-color-gray-6);
+}
+
+.stage-status-option:focus-visible {
+	outline: 2px solid var(--sl-color-accent);
+	outline-offset: -2px;
+}
+
+.stage-status-option[aria-checked='true'] {
+	color: var(--sl-color-black);
+	background: var(--sl-color-gray-2);
+	font-weight: 600;
+}
+
+.stage-status-option[data-status='doing'][aria-checked='true'] {
+	background: var(--ml-doing);
+}
+
+.stage-status-option[data-status='done'][aria-checked='true'] {
+	background: var(--ml-ok);
+}
+
+/* ---------------------------------------------------------------------------
+ * Tables: reading list and code map
+ * ------------------------------------------------------------------------- */
+
+.table-scroll {
+	overflow-x: auto;
+}
+
+.sl-markdown-content .table-scroll > table {
+	display: table;
+	width: 100%;
+	margin: 0;
+	font-size: var(--sl-text-sm);
+}
+
+table.file-table th,
+table.code-map th,
+table.file-table td:first-child,
+table.code-map td:first-child {
+	white-space: nowrap;
+}
+
+table.file-table td:first-child,
+table.code-map td:first-child {
+	width: 1%;
+}
+
+/* Starlight lets inline code break anywhere, which would shrink the name column to one character. */
+table.file-table td:first-child code,
+table.code-map td:first-child code {
+	white-space: nowrap;
+	overflow-wrap: normal;
+}
+
+table.code-map .stage-refs {
+	white-space: nowrap;
+}
+
+table.code-map .stage-refs a {
+	display: inline-block;
+	min-width: 1.6em;
+	margin-inline-end: 0.25em;
+	padding: 0 0.3em;
+	border-radius: 0.25rem;
+	background: var(--sl-color-accent-low);
+	color: var(--sl-color-text-accent);
+	text-align: center;
+	text-decoration: none;
+	font-weight: 600;
+}
+
+table.code-map tfoot td {
+	color: var(--sl-color-gray-3);
+	font-size: var(--sl-text-xs);
+}
+
+/* ---------------------------------------------------------------------------
+ * Home: request journey
+ * ------------------------------------------------------------------------- */
+
+.journey {
+	display: grid;
+	grid-template-columns: minmax(0, 600px) minmax(260px, 1fr);
+	gap: 1.75rem;
+	align-items: start;
+	margin: 1.25rem 0 0.5rem;
+}
+
+.journey-svg {
+	width: 100%;
+	height: auto;
+	display: block;
+	font-family: var(--sl-font);
+}
+
+.journey-lane-bg {
+	fill: var(--sl-color-gray-6);
+	opacity: 0.55;
+}
+
+.journey-lane-name {
+	font-size: 12px;
+	font-weight: 600;
+	fill: var(--sl-color-white);
+}
+
+.journey-lane-sub {
+	font-size: 10px;
+	fill: var(--sl-color-gray-3);
+}
+
+.journey-divider {
+	stroke: var(--sl-color-gray-5);
+}
+
+.journey-edge {
+	fill: none;
+	stroke: var(--sl-color-gray-4);
+	stroke-width: 1.2;
+}
+
+.journey-loop {
+	stroke-dasharray: 4 3;
+}
+
+.journey-arrowhead {
+	fill: var(--sl-color-gray-4);
+}
+
+.journey-edge-label {
+	font-size: 10px;
+	fill: var(--sl-color-gray-2);
+}
+
+.journey-box {
+	cursor: pointer;
+	outline: none;
+}
+
+.journey-box rect {
+	fill: var(--sl-color-black);
+	stroke: var(--sl-color-gray-5);
+	stroke-width: 1;
+	transition: stroke 120ms;
+}
+
+.journey-box:hover rect {
+	stroke: var(--sl-color-gray-3);
+}
+
+.journey-box[data-active] rect {
+	stroke: var(--sl-color-accent);
+	stroke-width: 1.8;
+	fill: var(--sl-color-accent-low);
+}
+
+.journey-box:focus-visible rect {
+	stroke: var(--sl-color-accent);
+	stroke-width: 2.5;
+}
+
+.journey-box-title {
+	font-size: 11.5px;
+	font-weight: 600;
+	fill: var(--sl-color-white);
+}
+
+.journey-box[data-active] .journey-box-title {
+	fill: var(--sl-color-text-accent);
+}
+
+.journey-box-fn {
+	font-size: 9.5px;
+	font-family: var(--sl-font-mono);
+	fill: var(--sl-color-gray-3);
+}
+
+.journey-panel {
+	position: sticky;
+	top: calc(var(--sl-nav-height) + 1rem);
+	display: flex;
+	flex-direction: column;
+	gap: 0.6rem;
+	font-size: var(--sl-text-sm);
+	line-height: 1.7;
+}
+
+.journey-panel p {
+	margin: 0;
+}
+
+.journey-kicker,
+.journey-label {
+	font-size: var(--sl-text-xs);
+	color: var(--sl-color-gray-3);
+}
+
+.journey-label {
+	margin-top: 0.4rem !important;
+	font-weight: 600;
+}
+
+.journey-title {
+	margin: 0;
+	font-size: var(--sl-text-xl);
+	color: var(--sl-color-white);
+}
+
+.journey-fn {
+	margin: 0;
+	padding: 0.5rem 0.75rem;
+	border-radius: 0.375rem;
+	background: var(--sl-color-gray-6);
+	overflow-x: auto;
+	font-size: var(--sl-text-xs);
+}
+
+.journey-detail code,
+.mental-model code,
+.roadmap code {
+	font-family: var(--sl-font-mono);
+	font-size: 0.875em;
+	padding: 0.1em 0.3em;
+	border-radius: 0.25rem;
+	background: var(--sl-color-bg-inline-code);
+}
+
+.journey-refs {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 0.15rem;
+}
+
+.journey-nav {
+	display: flex;
+	gap: 0.5rem;
+	margin-top: 0.5rem;
+}
+
+.journey-nav button {
+	cursor: pointer;
+	padding: 0.35rem 0.9rem;
+	border-radius: 999px;
+	border: 1px solid var(--sl-color-gray-4);
+	background: transparent;
+	color: var(--sl-color-white);
+	font: inherit;
+	font-size: var(--sl-text-sm);
+}
+
+.journey-nav button.primary {
+	border-color: var(--sl-color-accent);
+	background: var(--sl-color-accent);
+	color: var(--sl-color-black);
+	font-weight: 600;
+}
+
+.journey-nav button:disabled {
+	cursor: default;
+	opacity: 0.4;
+}
+
+@media (max-width: 48rem) {
+	.journey {
+		grid-template-columns: minmax(0, 1fr);
+	}
+
+	/* Stacked: keep the step details on screen while the diagram scrolls. */
+	.journey-panel {
+		top: auto;
+		bottom: 0;
+		z-index: 2;
+		max-height: 45vh;
+		overflow-y: auto;
+		padding: 0.75rem 1rem;
+		border: 1px solid var(--sl-color-hairline-light);
+		border-radius: var(--ml-radius) var(--ml-radius) 0 0;
+		background: var(--sl-color-bg);
+		box-shadow: 0 -0.5rem 1.5rem rgb(0 0 0 / 0.25);
+	}
+}
+
+/* ---------------------------------------------------------------------------
+ * Home: mental models
+ * ------------------------------------------------------------------------- */
+
+.mental-models {
+	list-style: none;
+	margin: 1.25rem 0 0;
+	padding: 0;
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr));
+	gap: 1rem;
+}
+
+.mental-model {
+	display: grid;
+	grid-template-columns: 2rem minmax(0, 1fr);
+	gap: 0.25rem 0.75rem;
+	padding: 1rem 1.1rem;
+	border: 1px solid var(--sl-color-hairline-light);
+	border-radius: var(--ml-radius);
+	background: var(--sl-color-bg-nav);
+}
+
+.mental-model-num {
+	font-size: 1.5rem;
+	font-weight: 700;
+	line-height: 1.2;
+	color: var(--sl-color-accent);
+}
+
+.mental-model h3 {
+	margin: 0 0 0.35rem;
+	font-size: var(--sl-text-lg);
+	color: var(--sl-color-white);
+}
+
+.mental-model p {
+	margin: 0;
+	font-size: var(--sl-text-sm);
+	line-height: 1.75;
+	color: var(--sl-color-gray-2);
+}
+
+.mental-model-refs {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.2rem 0.9rem;
+	margin-top: 0.6rem !important;
+}
+
+/* ---------------------------------------------------------------------------
+ * Home: roadmap
+ * ------------------------------------------------------------------------- */
+
+.roadmap {
+	margin-top: 1.25rem;
+}
+
+.roadmap-progress {
+	display: flex;
+	flex-direction: column;
+	gap: 0.5rem;
+	margin-bottom: 1rem;
+	font-size: var(--sl-text-sm);
+	color: var(--sl-color-gray-2);
+}
+
+.roadmap-progress p {
+	margin: 0;
+}
+
+.roadmap-progress a {
+	color: var(--sl-color-text-accent);
+}
+
+.roadmap-bar {
+	height: 0.4rem;
+	border-radius: 999px;
+	background: var(--sl-color-gray-6);
+	overflow: hidden;
+}
+
+.roadmap-bar span {
+	display: block;
+	height: 100%;
+	border-radius: inherit;
+	background: var(--ml-ok);
+	transition: width 200ms;
+}
+
+.roadmap-list {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr));
+	gap: 0.75rem;
+}
+
+.roadmap-link {
+	display: grid;
+	grid-template-columns: 2.25rem minmax(0, 1fr);
+	grid-template-rows: auto auto;
+	gap: 0.3rem 0.75rem;
+	height: 100%;
+	box-sizing: border-box;
+	padding: 0.85rem 1rem;
+	border: 1px solid var(--sl-color-hairline-light);
+	border-radius: var(--ml-radius);
+	color: inherit;
+	text-decoration: none;
+	transition: border-color 120ms, background 120ms;
+}
+
+.roadmap-link:hover {
+	border-color: var(--sl-color-accent);
+	background: var(--sl-color-bg-nav);
+}
+
+.roadmap-num {
+	grid-row: span 2;
+	display: grid;
+	place-items: center;
+	width: 2.25rem;
+	height: 2.25rem;
+	border-radius: 50%;
+	background: var(--sl-color-gray-6);
+	color: var(--sl-color-white);
+	font-weight: 700;
+}
+
+.roadmap-item[data-status='doing'] .roadmap-num {
+	background: var(--ml-doing);
+	color: var(--sl-color-black);
+}
+
+.roadmap-item[data-status='done'] .roadmap-num {
+	background: var(--ml-ok);
+	color: var(--sl-color-black);
+}
+
+.roadmap-body {
+	display: flex;
+	flex-direction: column;
+	gap: 0.2rem;
+}
+
+.roadmap-title {
+	font-weight: 600;
+	color: var(--sl-color-white);
+}
+
+.roadmap-text {
+	font-size: var(--sl-text-sm);
+	line-height: 1.6;
+	color: var(--sl-color-gray-2);
+}
+
+.roadmap-meta {
+	grid-column: 2;
+	display: flex;
+	justify-content: space-between;
+	font-size: var(--sl-text-xs);
+	color: var(--sl-color-gray-3);
+}
+
+.roadmap-item[data-status='doing'] .roadmap-state {
+	color: var(--ml-doing);
+	font-weight: 600;
+}
+
+.roadmap-item[data-status='done'] .roadmap-state {
+	color: var(--ml-ok);
+	font-weight: 600;
+}
+
+/* ---------------------------------------------------------------------------
+ * Home: splash page sections
+ * ------------------------------------------------------------------------- */
+
+.home-section-lead {
+	color: var(--sl-color-gray-2);
+}

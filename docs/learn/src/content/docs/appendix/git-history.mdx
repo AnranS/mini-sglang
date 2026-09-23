@@ -1,0 +1,353 @@
+---
+title: 用 git 历史重走作者的路
+description: 沿着 15 个 commit 看 mini-sglang 怎样从一堆算子长成能服务的推理引擎，再用 7 个真实的修复 commit 做找 bug 练习。
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import Answer from '~/components/Answer.astro';
+import StageLink from '~/components/StageLink.astro';
+
+读完整的代码，看到的是结果；读 git 历史，看到的是顺序：作者先写什么、后写什么，哪些东西第一版就定型了，哪些改过好几次。这一页给两条路：
+
+- **从零搭起来**：15 站。前 14 站从第一个 commit 走到支持 radix cache，都在 2025-09-08 到 09-15 这一周里；最后一站是五个月后的 `page_size > 1`。每站列出这个 commit 带来了什么（以 `git show` 的 diff 为准）和几个阅读问题。
+- **修 bug 练习**：7 个上游修复 commit。先读修复前的代码自己找 bug，再看参考答案。
+
+## 怎么用这一页
+
+仓库一共 174 个 commit。最新的 3 个（`04e48db`、`d077e09`、`3b3c403`）是本 fork 加的文档，不属于作者的历史；作者的最后一个 commit 是 `9a91cfa`，共 171 个。
+
+几种常用的看法：
+
+```bash
+git show --stat 6d6df1c              # 这个 commit 动了哪些文件、多少行
+git show 6d6df1c -- python/minisgl/engine/engine.py   # 只看某个文件的改动
+git show 6d6df1c:python/minisgl/engine/engine.py      # 看那个时刻某个文件的全文
+git diff 6d6df1c 9a91cfa -- python/minisgl/engine/engine.py  # 和最新版对比
+git worktree add ../minisgl-old 900ed45   # 在旁边检出一份旧版本慢慢翻，不影响当前目录
+```
+
+<Aside type="caution" title="只读，不要跑">
+早期版本依赖的库、目录结构和今天都不一样（比如 kernel 绑定在 `9c53b69` 改用 tvm-ffi，`config/context.py` 后来改名），检出来多半跑不起来。这一页的练习都是读代码。
+</Aside>
+
+每站的「行数」用的是 `git show --stat` 最后一行的增删数，包括测试和头文件。
+
+## 路线一：从零搭起来
+
+### 第 0 站：第一个 commit
+
+[`da7f4a5`](https://github.com/sgl-project/mini-sglang/commit/da7f4a566de14750ebecb51d00ae5ea54a53f09c) initial commit，2025-09-08，+2,539 行。
+
+起点不是空仓库。这个 commit 已经有了 `layers/`（线性层、embedding、norm、rotary）、Llama 模型、FlashAttention 3 后端、KV cache 的 CUDA kernel（`kvcache.cu`，含 store 和 indexing）、`pynccl` 的占位，以及全局上下文 `Context`。**没有** engine，没有 scheduler，也没有任何服务端代码：它是一堆能单独测试的算子和一个模型定义。
+
+阅读问题：
+
+1. 这时的模型 `forward` 从哪里拿到 batch 信息？和今天 <StageLink id="s3" /> 讲的 `get_global_ctx().batch` 比，变了多少？
+2. `kvcache.cu` 里的 store kernel 和今天 `kernel/csrc/jit/store.cu` 里的 `store_kv_cache` 做的是同一件事吗？绑定方式有什么不同？
+
+### 第 1 站：Engine
+
+[`6d6df1c`](https://github.com/sgl-project/mini-sglang/commit/6d6df1c537ba36f5465e9048b1ca9ce43fa1d984) feat[1/n]: upstream engine，2025-09-08，+501/−186，26 个文件。
+
+新增 `Engine` 类：先在 meta device 上建模型，再用 `models/weight.py` 的 `load_hf_weight` 读权重、`load_state_dict`；按 `memory_ratio` 和剩余显存算出能放多少页 KV（`_determine_num_pages`）；KV cache 分配 `num_pages + 1` 页，页表多一行给 dummy 请求；初始化 gloo 和 NCCL 两套通信；各卡剩余显存差太多就报错。`forward_batch` 这时只调一次 `model.forward`，不采样。
+
+阅读问题：
+
+1. 多出来的那一页 KV 和那一行页表是给谁用的？今天的代码里还在吗？（<StageLink id="s4" />）
+2. 为什么要先在 meta device 上建模型？直接在 GPU 上建会多花什么？
+3. 各卡显存不均衡为什么值得直接报错，而不是各算各的页数？
+
+### 第 2 站：CUDA graph 和第一个「采样」
+
+[`f583dc0`](https://github.com/sgl-project/mini-sglang/commit/f583dc07ecbdbf61a15205e082795106bda2ff49) feat[2/n]: upstream cuda graph，2025-09-09，+268/−44。
+
+新增 `engine/graph.py` 的 `GraphWorker`，按一组 batch size 抓 decode 的 CUDA graph。FA3 后端的 `prepare_metadata` 用 dummy 请求把 batch 补齐到抓过的大小。`forward_batch` 能选择 replay，之后用 `argmax` 取下一个 token（代码里写着 `TODO` 以后换真正的 sampler），追加到请求上，再非阻塞地拷到两块 pinned 结果缓冲之一，用一个 CUDA event 标记拷完。
+
+阅读问题：
+
+1. 为什么要两块结果缓冲轮流用？今天的 `ForwardOutput` 和 `copy_done_event` 怎样解决同一个问题？（<StageLink id="s5" />）
+2. 补齐 batch 这件事当时写在 attention 后端里，今天写在哪里？（<StageLink id="s7" />）
+
+### 第 3 站：调度器骨架
+
+[`900ed45`](https://github.com/sgl-project/mini-sglang/commit/900ed45ce62e65f9e1c03dcebfd98d7f54b82529) feat[3/n]: update core part of scheduler，2025-09-09，+1,166/−59，34 个文件。
+
+一次加进来 `scheduler/`（`scheduler.py`、`prefill.py`、`decode.py`、`cache.py`、`table.py` 等）、`message/` 下的消息类型、`utils/mp.py` 里基于 ZMQ 的队列、`kvcache/` 的基类和不做前缀复用的 `naive_manager`。`main_loop` 第一版就是 overlap 的形状：scheduler 流和 engine 流分开，发射这一批之后才处理上一批的结果。但收到用户请求还是 `raise NotImplementedError`；prefill 按先来后到，放不下就 `break`，代码里写着 chunked prefill 是 `TODO`；decode 每一步现分配 KV，不够就 `raise NotImplementedError("TODO: Implement decode retract")`。
+
+阅读问题：
+
+1. 看 `main_loop` 开头：`self.last_batch = None` 之后紧接着 `blocking = not self.last_batch`，`blocking` 的值会是什么？这对 overlap 意味着什么？下一站怎么改的？
+2. prefill 的准入检查拿 `table_manager.available_size` 减去 `offset`。前者数的是什么，后者数的是什么？（答案在第 10 站的修复里。）
+3. decode 每步现分配、不够就报错；今天的 `PrefillAdder` 用 `reserved_size` 在准入时预留。两种做法各有什么代价？（<StageLink id="s5" />）
+
+### 第 4 站：让调度器跑对
+
+[`cd7bbad`](https://github.com/sgl-project/mini-sglang/commit/cd7bbadf84d38c991d0487adb7c2972f7b0850e9) feat[4/n]: scheduler correctness pass，2025-09-10，+135/−29。
+
+用户请求交给 `prefill_manager.add_raw_req`；是否阻塞改成看 prefill 和 decode 有没有可跑的；`ExitMsg` 抛 `KeyboardInterrupt` 退出；回复时跳过已经结束的请求；新增 `tests/core/test_scheduler.py`。还在 forward 之后加了一个调试用的 `torch.cuda.synchronize()`，下一站就删了。
+
+阅读问题：
+
+1. 这个 `synchronize()` 让结果变对了，也让 overlap 失效了。为什么？
+2. 一个请求为什么可能被「处理两次」，需要跳过？提示：overlap 下结束判断发生在哪一批之后。
+
+### 第 5 站：分词进程
+
+[`cb3b0c8`](https://github.com/sgl-project/mini-sglang/commit/cb3b0c8e70a6dc52a389b2371fb816e07e74a9ff) feat[5/n]: upstream tokenizer，2025-09-10，+273/−8。
+
+新增 `tokenizer/`（`server.py`、`tokenizer.py`、`detokenizer.py`）和 `message/frontend.py`；删掉上一站的 `synchronize()`；`main_loop` 加上 `@torch.inference_mode`。
+
+阅读问题：
+
+1. detokenizer 为什么不能每次把新 token 单独 decode 成文字？它保存了哪些状态？和今天的 `tokenizer/detokenize.py` 比一比。（<StageLink id="s8" />）
+
+### 第 6 站：HTTP 服务和进程拓扑
+
+[`436b019`](https://github.com/sgl-project/mini-sglang/commit/436b0195d98c82e874a43ef1263e12d265bd1b50) feat[6/n]: support frontend, tokenizer, many minor fixes，2025-09-10，+516/−31。
+
+新增 `server/api_server.py`（FastAPI 的 `/generate`，`ack_map` 和 `event_map` 第一版就在）、`server/args.py`、`server/launch.py`（每个 TP rank 一个 scheduler 进程，加一个共用的分词进程）和 `__main__.py`。下一个 commit [`6e61fa6`](https://github.com/sgl-project/mini-sglang/commit/6e61fa6637bac54fca9bcae701aef5b78a89fd1c)（feat[7/n]）加了多个分词进程。
+
+阅读问题：
+
+1. 这一版的 `listen` 断言收到的 uid 一定在 `ack_map` 里，今天的代码遇到不在的就跳过。什么情况下会收到一个不认识的 uid？（<StageLink id="s8" />）
+2. 画出这时的进程图，和今天 `launch_server` 起的进程对比。
+
+### 第 7 站：FlashInfer 后端
+
+[`dc209b6`](https://github.com/sgl-project/mini-sglang/commit/dc209b65446bf4fe7855c31161fa2b5edd1778ea) feat[8/n]: upstream flashinfer，2025-09-11，+451/−82。
+
+新增 `attention/fi.py` 和 `attention/utils.py`。FlashInfer 的 `plan`（把 batch 的元数据准备好）不在 `prepare_metadata` 里做，而是在第一层 attention 的 `forward` 里懒调用一次。
+
+阅读问题：
+
+1. `plan` 为什么要推迟到第一层 forward 才调？在 overlap 调度下，「调 `plan` 的时刻」和「GPU 真正读元数据的时刻」隔了多远？把这个问题记下来，修 bug 练习的第 7 题会用到。（<StageLink id="s7" />）
+
+### 第 8 站：混合后端
+
+[`fec1c61`](https://github.com/sgl-project/mini-sglang/commit/fec1c619a4033aa45c8ac492d196ea756601456f) feat[9/n]: support hybrid attention backend，2025-09-11，+114/−51。
+
+新增 `HybridBackend`：prefill 批和 decode 批交给两个不同的后端。当时两个名字用下划线连接，今天改成了逗号（`"fa,fi"`）。页表也从这时起直接传给后端。
+
+阅读问题：
+
+1. 混合后端抓 CUDA graph 时用的是哪一个？为什么只需要一个？
+
+### 第 9 站：张量并行
+
+[`80e7cfd`](https://github.com/sgl-project/mini-sglang/commit/80e7cfd74b8aed13e92fa98e125e5c5061cf664e) feat[10/n]: support TP，2025-09-15，+1,202/−46。
+
+1,202 行里有 571 行是 NCCL 的头文件 `nccl227.h`，174 行是 `tests/core/test_comm.py`。真正的新代码是：`pynccl.cu` 通信绑定、`index.cu` 里按词表切分的 embedding kernel、生成 `.clangd` 的 `kernel/__main__.py`，`all_gather` 改成返回结果，线性层把输出直接写进通信缓冲。LM head 的 all-gather 也在这里写好，其中一行后来被发现有 bug（修 bug 练习第 1 题）。
+
+阅读问题：
+
+1. 线性层为什么要把结果直接写进通信缓冲，而不是算完再拷过去？
+2. 按词表切分的 embedding，每张卡查不到的 token 输出什么？最后怎么合起来？（<StageLink id="s9" />）
+
+### 第 10 站：OpenAI 接口和第一个 benchmark
+
+[`ddc6dfa`](https://github.com/sgl-project/mini-sglang/commit/ddc6dfa456e22aa77c3ae1ef84f28aff858d1b43) feat[11/n]: support OpenAI v1 + benchmark + fix，2025-09-15，+673/−5。
+
+API server 加上 OpenAI v1 接口；新增 485 行的 `benchmark/utils.py`（今天 `python/minisgl/benchmark/client.py` 的前身）和 `tests/bench/simple.py`（今天 `benchmark/online/bench_simple.py` 的前身）。标题里的 fix 有两处：prefill 准入检查改成 `min(prefill 预算, KV 可用量 - offset, 页表空闲行数) <= 0`，把 token 数和表行数分开比；`TorchDistributedImpl.get_buffer` 原来直接返回输入张量本身，改成分配一块新的。
+
+阅读问题：
+
+1. 回到第 3 站的问题 2：旧的检查在什么情况下会放进一个 KV 放不下的请求，或者挡住一个其实放得下的请求？
+2. 今天的 `client.py` 怎样算 TTFT 和每个 token 的间隔？（<StageLink id="s10" />）
+
+### 第 11 站：真正重叠起来
+
+[`e3b406b`](https://github.com/sgl-project/mini-sglang/commit/e3b406b2c8f92ae0747b3bc2faecfae3c857dcb0) fix: fix overlap schedule, now mostly overlapped，2025-09-15，+13/−4。
+
+只动了十几行，却是 overlap 调度能真正起作用的关键：准备元数据的 `engine.prepare_batch` 从 engine 流的代码块里挪出来，在 scheduler 流上、等待 engine 流之前做完；拼 `input_ids`（把各请求在 GPU 上的 token 拼起来）挪进 engine 里，在 engine 流上做，因为这些 token 是上一批在 engine 流上写的。
+
+阅读问题：
+
+1. 如果在 scheduler 流上拼 `input_ids`，会读到什么？为什么不报错却结果不对？
+2. 今天 `token_pool` 的读写分别发生在哪个流上？（<StageLink id="s5" />）它是 `19c8a24` 引入的，见下面的「中间跳过的几站」。
+
+### 第 12 站：chunked prefill
+
+[`35b06c3`](https://github.com/sgl-project/mini-sglang/commit/35b06c3f6369a38832c780ac3d6e17d35fe6dc10) feat[12/n]: support chunked prefill，2025-09-15，+133/−26。
+
+新增 `ChunkedReq`：它的 `append` 不追加 token（中间块的输出没有意义），还有 `next_chunk` 生成下一块。没做完的请求放回等待队列最前面。KV 在第一块时就按整个 prompt 一次分配。顺带修了两处：`Req.append` 里更新 `cached_len` 的顺序；`CacheManager.free` 原来释放 `indices[:in_cache_len]`，改成释放 `indices[old_cache_len:new_cache_len]`。
+
+阅读问题：
+
+1. `free` 的旧写法释放的前 `in_cache_len` 个位置里，有一部分本来就是前缀缓存自己的页。释放它们会怎样？
+2. 和今天的 `ChunkedReq`、`PrefillAdder._add_one_req` 比，分块的边界是怎么定的？（<StageLink id="s5" />）
+
+### 第 13 站：radix cache
+
+[`8c560d1`](https://github.com/sgl-project/mini-sglang/commit/8c560d16c24348faa37648bf41b63a13f36da428) feat[13/n]: support radix tree，2025-09-15，+307/−34。
+
+新增 228 行的 `kvcache/radix_manager.py`、C++ 的 `csrc/radix.cpp` 和 `kernel/radix.py`（`fast_compare_key`，比较两段 key 的公共前缀长度）。因为树的 key 放在 CPU 上，请求多了一份 `host_ids` 和 `append_host`。这时请求结束的条件里 EOS 还是 `TODO`。
+
+到这里，第一周的 16 个 commit 已经搭出了今天的主干：engine、CUDA graph、overlap 调度器、分词进程、HTTP 服务、两种 attention 后端、TP、chunked prefill 和 radix cache。
+
+阅读问题：
+
+1. radix 树的 key 为什么放在 CPU 上而不是 GPU 上？（<StageLink id="s6" />）
+2. 用 `git diff 8c560d1 9a91cfa -- python/minisgl/kvcache/` 看这个文件后来的变化，哪些是改名，哪些是逻辑变化？
+
+### 第 14 站：page_size 大于 1
+
+[`5e52ef3`](https://github.com/sgl-project/mini-sglang/commit/5e52ef3f759280b333127513217c6b4160f73e44) [Feature] Support `page_size > 1` (#79)，2026-02-21，+202/−116，11 个文件。
+
+隔了五个月。空闲槽位改成只存每页的起点（`arange` 乘 `page_size`）；新增 `allocate_paged` 和 `_write_page_table`；请求结束时按页对齐往前缀缓存里插，没对齐的尾巴直接释放；新增 `lazy_free_region`；`available_size` 变成空闲页数乘 `page_size`；`bench.py` 用 `page_size=256`。
+
+阅读问题：
+
+1. 页表里存的仍然是每个 token 的位置，而不是页号。为什么？（<StageLink id="s4" />）
+2. 读这个版本的 `CacheManager._allocate`：`evict` 的参数和返回值是什么单位，`_free_slots` 里存的是什么单位？如果你看出了问题，去做修 bug 练习第 4 题。
+
+## 中间跳过的几站
+
+第 13 站和第 14 站之间有一百多个 commit。下面几个对理解今天的代码最有用：
+
+| commit | 日期 | 带来了什么 | 相关章节 |
+| --- | --- | --- | --- |
+| [`9c53b69`](https://github.com/sgl-project/mini-sglang/commit/9c53b690a7b04adbffc0917c3c80526f8033958c) | 2025-11-02 | 用 tvm-ffi 重写 kernel 绑定，新增 `csrc/jit/index.cu`、`store.cu` | <StageLink id="s10" /> |
+| [`5000986`](https://github.com/sgl-project/mini-sglang/commit/5000986f87b330eb73fb9b94e250179748f55a2d) | 2025-11-08 | 整理出 `load_aot` 和 `load_jit` 两个入口 | <StageLink id="s10" /> |
+| [`19c8a24`](https://github.com/sgl-project/mini-sglang/commit/19c8a24d250bb3760f77457456e69da644c5310c) | 2025-12-06 | 引入 `token_pool`，减少拼 `input_ids` 的开销 | <StageLink id="s5" /> |
+| [`a52ad83`](https://github.com/sgl-project/mini-sglang/commit/a52ad83877243a94a8f7998f69e95d7628b10141) | 2025-12-09 | NVTX 标注；`DISABLE_OVERLAP_SCHEDULING` 和 `normal_loop` | <StageLink id="s5" /> |
+| [`71fe056`](https://github.com/sgl-project/mini-sglang/commit/71fe0563293df33e1b2dff0770bdb65ce6729c38) | 2025-12-15 | 重写 prefill 调度（#5） | <StageLink id="s5" /> |
+| [`f6239df`](https://github.com/sgl-project/mini-sglang/commit/f6239df6557b8c90a36f19595aa7dc8714b8deb0) | 2026-02-06 | 用 fused MoE 支持 Qwen3-MoE（#59） | <StageLink id="s10" /> |
+| [`578df98`](https://github.com/sgl-project/mini-sglang/commit/578df98d4c1c9430925508fcf82eea0ff09058ba) | 2026-02-17 | 请求取消（#16） | <StageLink id="s8" /> |
+
+## 路线二：修 bug 练习
+
+下面 7 题都来自上游合并的修复。做法一样：先用 `git show <sha>^:<文件>` 读修复**之前**的代码，按提示找出 bug、想好怎么修，再展开参考答案，最后用 `git show <sha>` 对照真正的修复。题目大致从易到难排。
+
+### 练习 1：LM head 的 all-gather
+
+修复 commit：[`7c59f4d`](https://github.com/sgl-project/mini-sglang/commit/7c59f4df85dfc938915249e147d948399dc29fff)（#98），2026-03-10，改了 1 行。相关章节：<StageLink id="s9" />。
+
+```bash
+git show 7c59f4d^:python/minisgl/layers/embedding.py   # 看 ParallelLMHead.forward
+```
+
+现象：TP 大于 1 时，一次只发一个请求输出正常，多个请求一起跑就开始胡言乱语。
+
+提示：写出 all-gather 之后 `output_tensor` 每一步的形状。词表被切成 `tp_size` 段，第 `r` 张卡算的是第 `r` 段。
+
+<Answer>
+all-gather 之后 `view` 成 `(tp, bs, V/tp)`。旧代码 `movedim(0, -1)` 得到的是 `(bs, V/tp, tp)`，再 `reshape` 成 `(bs, V)`，每一行变成「第 0 段的第 0 个、第 1 段的第 0 个……」交错排列，而不是第 0 段整段接第 1 段整段。正确的做法是 `permute(1, 0, 2)` 得到 `(bs, tp, V/tp)`，`contiguous()` 之后再 `reshape`，修复就是这样改的。
+
+bs 为 1 时走的是前面单独的分支：`(tp, 1, V/tp)` 在内存里本来就是按卡连续排的，直接 `view(1, -1)` 就对了。所以单请求测试发现不了这个 bug。用 `git log -S "movedim(0, -1)"` 可以查到它是第 9 站 `80e7cfd` 引入的，存在了将近半年。
+</Answer>
+
+### 练习 2：decode batch 的顺序
+
+修复 commit：[`9a91cfa`](https://github.com/sgl-project/mini-sglang/commit/9a91cfafe754aa85daee49998176275667eb58f2)（#113），2026-05-17，改了 1 行。相关章节：<StageLink id="s9" />。
+
+```bash
+git show 9a91cfa^:python/minisgl/scheduler/decode.py   # 看 schedule_next_batch
+git show 9a91cfa^:python/minisgl/core.py               # 看 Req 的定义
+```
+
+提示：每个 TP rank 各有一个 scheduler 进程，各自独立地组 batch。`running_reqs` 是什么容器？里面元素的哈希值怎么来的？
+
+<Answer>
+`running_reqs` 是 `Req` 的 `set`，`Req` 是 `@dataclass(eq=False)`，哈希用的是对象 id，也就是内存地址。不同进程里同一个请求的对象地址不同，`list(self.running_reqs)` 的顺序也就可能不同。于是两张卡上 batch 第 `i` 行对应的是不同的请求，行并行层做 all-reduce 时会把不同请求的部分和加到一起，输出全错。
+
+修复改成 `sorted(self.running_reqs, key=lambda req: req.uid)`。uid 是分词进程分配的，所有 rank 看到的都一样。prefill 没有这个问题，因为等待队列是按到达顺序的列表。
+</Answer>
+
+### 练习 3：每张卡各自采样
+
+修复 commit：[`690f55a`](https://github.com/sgl-project/mini-sglang/commit/690f55a342076e22ce4deb271424c681eb84151b)（#88），2026-02-26，加了 1 行。相关章节：<StageLink id="s9" />。
+
+```bash
+git show 690f55a^:python/minisgl/engine/engine.py   # 看 Engine.__init__ 和 forward_batch
+```
+
+现象（上游 issue #84）：TP=2、temperature 大于 0 时，rank 0 已经结束的请求，rank 1 还在接着跑，显存迟迟不释放。PR 在 GitHub 上的标题因此是「Fix GPU memory leak caused by output inconsistency」。
+
+提示：LM head 的 all-gather 之后，每张卡手里的 logits 一样吗？谁在采样？采样的随机数从哪里来？
+
+<Answer>
+all-gather 之后每张卡都有完整、相同的 logits，而且每张卡都独立调用采样。FlashInfer 的采样从 PyTorch 默认 CUDA 生成器取种子和偏移。只要各 rank 的生成器状态不同，temperature 大于 0 时就会采出不同的 token：rank 0 采到 EOS 结束了请求，rank 1 没采到，还在继续 decode。之后两边的 batch 不再一致，通信也对不上了。
+
+修复是在 `Engine.__init__` 里加 `torch.manual_seed(42)`，让所有 rank 的生成器从同一个状态出发，此后每一步消耗的随机数一样多，采样结果也就一致。修复前各 rank 的生成器状态**为什么**会不同，本页没有核实。另一种修法是只让 rank 0 采样再广播，代价是每步多一次通信。
+</Answer>
+
+### 练习 4：按页驱逐的单位
+
+修复 commit：[`dae78f6`](https://github.com/sgl-project/mini-sglang/commit/dae78f6bb97d5c5aaadbc0772fc964d48a8ee726)（#80），2026-02-22，改了 2 行，另加 198 行测试 `tests/core/test_cache_allocate.py`。相关章节：<StageLink id="s4" />、<StageLink id="s6" />。
+
+```bash
+git show dae78f6^:python/minisgl/scheduler/cache.py   # 看 CacheManager._allocate
+```
+
+提示：这是第 14 站 `5e52ef3` 引入 `page_size > 1` 的第二天。`evict` 的参数和返回值是 token 还是页？`_free_slots` 里存的是什么？
+
+<Answer>
+`_free_slots` 存的是每个空闲页的**起点**，一个元素代表一页；前缀缓存的 `evict(size)` 按 **token** 计数，返回的也是被驱逐的每个 token 的位置。旧代码 `evict(needed_pages - free_pages)` 把页数当 token 数传进去，驱逐得太少；又把返回的所有 token 位置原样拼进 `_free_slots`，每个 token 位置都被当成一页的起点。结果是分出去的「页」互相重叠，不同请求的 KV 写到同一块显存里。
+
+修复是 `evict((needed_pages - free_pages) * self.page_size)`，再用 `evicted[:: self.page_size]` 只取每页的起点。这依赖前缀缓存里的节点总是按整页存的，第 14 站的「按页对齐往前缀缓存里插」保证了这一点。
+</Answer>
+
+### 练习 5：max_seq_len 向上对齐
+
+修复 commit：[`ab5d260`](https://github.com/sgl-project/mini-sglang/commit/ab5d260c357fed20c4b8065fe8afcf753a8610bf)（#68），2026-02-17。相关章节：<StageLink id="s4" />。
+
+```bash
+git show ab5d260^:python/minisgl/engine/engine.py       # 看 self.max_seq_len 怎么算
+git show ab5d260^:python/minisgl/scheduler/scheduler.py # 搜 engine.max_seq_len
+```
+
+提示：页表的宽度为什么要对齐到 32？scheduler 拿 `engine.max_seq_len` 做什么？
+
+<Answer>
+旧代码是 `self.max_seq_len = _align_up_32(min(config.max_seq_len, self.num_pages))`。对齐是为了让页表每行是 128 字节的整数倍，但同一个值还被 scheduler 当成逻辑上限：检查输入是否过长、算 `max_output_len`。当 KV 总共只有 `num_pages` 个 token 位置、而 `num_pages` 不是 32 的倍数时，向上对齐后的上限超过了 KV 的真实容量，一个本该被拒绝的超长请求会被接纳。
+
+这个 PR 改成向下对齐（小于 32 时保持原值）。同一天 20 分钟后，作者在 [`e7d4f65`](https://github.com/sgl-project/mini-sglang/commit/e7d4f65e8b4e3498bb98f1280ff922fa19fdc47e) 里把它改成了今天的样子：逻辑上限 `max_seq_len = min(config.max_seq_len, num_pages)` 不对齐，只有页表宽度用 `_align_up_32`。把「给调度用的上限」和「给内存布局用的宽度」拆成两个值，比在一个值上取舍更干净。
+</Answer>
+
+### 练习 6：分裂节点的时间戳
+
+修复 commit：[`ba3b55c`](https://github.com/sgl-project/mini-sglang/commit/ba3b55c04654a7cf5bea49ce430cbfcce0032bfa)（#124），2026-05-10，加了 1 行。相关章节：<StageLink id="s6" />。
+
+```bash
+git show ba3b55c^:python/minisgl/kvcache/radix_cache.py   # 看 _tree_walk 和 RadixTreeNode.split_at
+```
+
+提示：一次匹配只命中了某个节点的前半段，节点被分裂成父子两段。新的父节点的 `timestamp` 是多少？驱逐按什么顺序挑节点？
+
+<Answer>
+`split_at` 用原节点的 `self.timestamp` 创建新的父节点，也就是上一次访问的旧时间。`_tree_walk` 在完全匹配一个节点时会把它的时间戳更新成 `tic`，但分裂后直接 `return`，刚被命中的前半段就一直带着旧时间戳。
+
+驱逐时只看叶子，按时间戳建小顶堆，最旧的先走；子节点被驱逐后，父节点变成叶子，也进入堆里。于是这段刚被用过的前缀会比它应得的更早被驱逐，下一个相同前缀的请求就要重算。修复是在分裂后加一行 `node.timestamp = tic`。没被命中的后半段保留旧时间戳是对的，它这次确实没被访问。
+</Answer>
+
+### 练习 7：FlashInfer 的竞争
+
+修复 commit：[`20fcd7f`](https://github.com/sgl-project/mini-sglang/commit/20fcd7f3c6a1898a61139fae1c97cc7a40bd8d66)（#103），2026-03-13，+7/−5，3 个文件。相关章节：<StageLink id="s5" />、<StageLink id="s7" />。
+
+```bash
+git show 20fcd7f^:python/minisgl/attention/fi.py           # 看 _initialize_metadata_once
+git show 20fcd7f^:python/minisgl/scheduler/scheduler.py    # 搜 OVERLAP_EXTRA_SYNC
+```
+
+现象：开着 overlap 调度、用 FlashInfer 后端时，偶发 illegal memory access；关掉 overlap 就不出现。在此之前，作者在 [`46255ef`](https://github.com/sgl-project/mini-sglang/commit/46255effe4166e7d433766dd98237ebfaadbc82e)（2026-01-06）为 issue #58 加过一个默认关闭的开关 `OVERLAP_EXTRA_SYNC`，打开后每批 forward 前同步一次 scheduler 流。
+
+提示：回到第 7 站的问题。`plan(..., non_blocking=True)` 把 CPU 上的元数据放到哪里、怎样送到 GPU？overlap 下 CPU 比 GPU 领先一批，第二次 `plan` 发生时，第一次的拷贝一定已经执行了吗？
+
+<Answer>
+FlashInfer 的 `plan` 先把 CPU 上的元数据写进它内部一块复用的 pinned 缓冲，再发一个异步的 H2D 拷贝。这个拷贝排在流上，要等前面的 GPU 工作做完才执行。overlap 调度下 CPU 发射完第 N 批就去准备第 N+1 批，第 N+1 次 `plan` 改写 pinned 缓冲时，第 N 次的拷贝可能还没执行，于是第 N 批读到的是第 N+1 批的元数据，页索引越界，就是 illegal memory access。
+
+修复给后端加了一个 CUDA event：每次 `plan` 之后 `record()`，下一次 `plan` 之前 `synchronize()`，只等上一次 `plan` 发出的拷贝完成，不必等整批 forward 结束。`_initialize_metadata_once` 因此从 `staticmethod` 改成普通方法。有了它，`OVERLAP_EXTRA_SYNC` 这个绕过办法就删掉了。按 PR 描述，它可能同时解决了 issue #58、#67、#89 和 #102。
+</Answer>
+
+## 旧材料里的描述，这一页改了什么
+
+本页的 commit 列表最初来自旧学习地图（原来在 `docs/learning-map/` 下，已删除，可以在 git 历史里找到），对照 diff 后改正了几处：
+
+- 旧地图把 `6d6df1c` 称为「最初的版本，只有 engine，全项目约 2,540 行」。2,539 行其实是 `da7f4a5`（initial commit）的新增行数，而那时还没有 engine；`6d6df1c` 是在已有的算子和模型之上加 Engine 的第二个 commit，+501/−186。
+- 旧地图写 `436b019` 时「全项目约 4,730 行」、`35b06c3` 时「约 6,260 行」。按 `python/minisgl` 下 `.py` 文件的总行数数，分别是 4,499 和 5,774 行，和旧数字对不上，所以本页只用 `git show --stat` 的增删数。
+- 旧路线没有 `6e61fa6`（feat[7/n]，多分词进程），本页在第 6 站里补上了它。
+- 旧路线从 `6d6df1c` 起步，本页加了第 0 站 `da7f4a5`。
+- 第 9 站 `80e7cfd` 的 +1,202 行里，571 行是 NCCL 头文件，174 行是测试，新写的逻辑远没有数字看起来多。
+- 修 bug 练习 7 旧地图只标了阶段 7；它只在 overlap 调度下出现，本页把 <StageLink id="s5" /> 也列上了。

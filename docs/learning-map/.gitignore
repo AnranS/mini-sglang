@@ -1,5 +1,0 @@
-node_modules/
-# The repository root ignores *.json; these are build configuration, not data.
-!package.json
-!package-lock.json
-!tsconfig.json

@@ -1,0 +1,325 @@
+---
+title: 跑起来，单步调试
+description: 用单进程的 LLM 类跑通一个请求，在调试器里把它从头跟到尾。
+sidebar:
+  order: 1
+  label: 1 · 跑起来，单步调试
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import Answer from '~/components/Answer.astro';
+import FileTable from '~/components/FileTable.astro';
+import Mermaid from '~/components/Mermaid.astro';
+import Src from '~/components/Src.astro';
+import SrcCode from '~/components/SrcCode.astro';
+import StageHeader from '~/components/StageHeader.astro';
+import StageLink from '~/components/StageLink.astro';
+
+<StageHeader id="s1" />
+
+## 这一阶段要搞懂什么
+
+读源码之前，先让它在你的机器上跑起来，再用调试器把一个请求从进门跟到出门。mini-sglang 提供了一个单进程的离线接口 `LLM`：它直接继承调度器 `Scheduler`，没有 HTTP、没有 ZeroMQ、没有子进程，普通的 Python 调试器就能打断点。后面所有章节的实验都建立在它上面。读完这一章，你应该能回答：
+
+- `LLM` 只换掉了哪两个方法，就绕开了整个多进程架构？
+- `generate` 调用的 `run_forever` 是个死循环，它是怎么返回的？
+- 调试时要关掉哪两样东西，断点才不会乱跳、才能单步进模型代码？
+- 同一个 prompt 连续生成两次，为什么输出可能不一样？
+- 第一次启动为什么特别慢？
+
+## 精读清单
+
+<FileTable files={[
+  { path: 'llm/llm.py', sym: 'LLM.generate', note: '请求放进哪里，循环怎么结束' },
+  { path: 'llm/llm.py', sym: 'LLM.offline_receive_msg', note: '什么时候抛出 `RequestAllFinished`；`prefill_budget` 在这里起什么作用' },
+  { path: 'llm/llm.py', sym: 'LLM.offline_send_result', note: '为什么有的 token 不放进输出' },
+  { path: 'scheduler/io.py', sym: 'SchedulerIOMixin.__init__', note: '`offline_mode` 时哪几行直接跳过了' },
+  { path: 'scheduler/scheduler.py', sym: 'Scheduler.run_forever', note: '环境变量怎么在两个循环之间切换' },
+  { path: 'env.py', sym: 'EnvClassSingleton', note: '环境变量的名字怎么拼出来，什么时候读' },
+  { path: 'engine/graph.py', sym: '_determine_cuda_graph_bs', note: '`cuda_graph_max_bs=0` 时返回什么' },
+]} />
+
+## 讲解
+
+### 安装
+
+mini-sglang 只支持 Linux（x86_64 和 aarch64），Windows 上用 WSL2。仓库根目录的 `README.md` 推荐用 `uv`：
+
+```bash
+git clone https://github.com/sgl-project/mini-sglang.git
+cd mini-sglang
+uv venv --python=3.12
+source .venv/bin/activate
+uv pip install -e .
+```
+
+几点要注意：
+
+- 要装好 NVIDIA CUDA Toolkit，版本和驱动匹配。mini-sglang 自己的 kernel 和 FlashInfer 的 kernel 都是第一次用到时现场编译（JIT）的，没有编译器会在运行时才报错。
+- `pyproject.toml` 要求 Python 3.10 及以上，并钉住了几个关键依赖的范围：`torch<2.10.0`、`transformers>=4.56.0,<=4.57.3`、`flashinfer-python>=0.5.3`，还依赖 `sgl_kernel` 和 `apache-tvm-ffi`。换版本之前先看这里。
+- `uv pip install -e .` 是可编辑安装，改了 `python/minisgl/` 下的代码立刻生效，后面加打印、改代码的实验都靠它。要跑测试和格式检查，装 `".[dev]"`。
+- 模型权重第一次用到时从 Hugging Face 下载 safetensors 文件（<Src path="utils/hf.py" sym="download_hf_weight" />）。`model_path` 也可以直接写本地目录。
+
+本站的实测环境是 RTX 4080 SUPER、WSL2、PyTorch 2.9.1（CUDA 12.8）、FlashInfer 0.7.0，见 [实测记录](../../appendix/measurements/)。
+
+### 最小脚本
+
+```python title="run_llm.py"
+from minisgl.core import SamplingParams
+from minisgl.llm import LLM
+
+llm = LLM(
+    "Qwen/Qwen3-0.6B",
+    attention_backend="fi",
+    max_seq_len_override=4096,
+    cuda_graph_max_bs=8,
+    memory_ratio=0.5,
+)
+out = llm.generate(["The capital of France is"], SamplingParams(temperature=0.0, max_tokens=16))
+print(out[0]["text"])
+llm.shutdown()
+```
+
+这是实测记录里的「最小配置」，每个参数都是为了启动快、好调试：
+
+- `attention_backend="fi"`：固定用 FlashInfer。默认的 `"auto"` 按显卡的计算能力选后端，换一张卡可能选到别的后端，结果就没法和本站对照了（<StageLink id="s7" />）。
+- `max_seq_len_override=4096`：把最大序列长度从模型的 40,960 降到 4,096，每个请求在 `page_table` 里占的一行就短了十倍（<StageLink id="s2" />）。
+- `cuda_graph_max_bs=8`：只录 1、2、4、8 四个 batch 大小的 CUDA graph。默认配置在这张 16 GB 的卡上要录 23 个（加载模型前的空闲显存不超过 80 GiB 时，上限是 160）。
+- `memory_ratio=0.5`：模型权重加 KV 池一共只用加载模型前空闲显存的一半，给调试器、别的程序留地方。
+
+`generate` 接受字符串或者 token id 列表。字符串直接用 tokenizer 编码，**不会**套对话模板；想要对话格式，自己先调 `llm.tokenizer.apply_chat_template`（<StageLink id="s5" /> 的动手实验有例子）。返回值是每个 prompt 一个字典，`text` 是解码后的文字，`token_ids` 是输出的 token。
+
+<Aside type="note" title="实测：最小配置的输出和耗时">
+在 RTX 4080 SUPER 上，上面的脚本第一次 `generate` 输出 ` Paris. The capital of France is also the capital of the Republic of France.`。FlashInfer 的编译结果已经缓存时，创建 `LLM` 用 5.04 s，第一次 `generate` 用 0.086 s。
+</Aside>
+
+### `LLM` 只换了收发的两头
+
+`LLM` 继承 `Scheduler`，构造时传 `offline_mode=True`。调度器的 I/O 部分在 `SchedulerIOMixin` 里，看到这个标志就把收发消息的两个方法换成 `LLM` 自己的，然后直接返回，一个 socket 都不建：
+
+<SrcCode path="scheduler/io.py" sym="SchedulerIOMixin.__init__" to="return  # early exit" mark={['if config.offline_mode:']} />
+
+所以调度器、引擎、KV 池、前缀缓存，跑的都是和服务模式完全相同的代码，只是消息的来源和去向变了：
+
+- 服务模式下，请求由 tokenizer 进程分好词，通过 ZeroMQ 送来；结果通过 ZeroMQ 送给 detokenizer 进程。
+- 离线模式下，`offline_receive_msg` 从 Python 列表里取请求、自己分词；`offline_send_result` 把 token 记进字典。
+
+另外两个限制也来自这里：`LLM` 固定用 `DistributedInfo(0, 1)`，只能单卡；引擎初始化时会断言 CUDA 还没初始化，全局 `Context` 也只能设置一次（<StageLink id="s2" />），所以**一个进程里只能创建一个 `LLM`**，创建之前也不要在脚本里碰 CUDA 张量。
+
+### `generate` 做了什么
+
+<SrcCode path="llm/llm.py" sym="LLM.generate" mark={['self.run_forever()', 'except RequestAllFinished:']} />
+
+1. 清空上一次的状态，把每个 prompt 和它的采样参数放进 `pending_requests`。`uid` 每次调用都从 0 重新编号。
+2. 调用 `run_forever`。它是调度器的主循环，里面是一个 `while True`，永远不会正常返回。
+3. 循环靠一个异常结束：`RequestAllFinished`。捕获它之后，按 `uid` 顺序把输出的 token 解码成文字。
+
+异常是在哪里抛出的？
+
+<SrcCode path="llm/llm.py" sym="LLM.offline_receive_msg" mark={['raise RequestAllFinished()', 'if sum_input_len >= self.prefill_budget:']} />
+
+调度器每一轮开头都会调用 `receive_msg`。只有手上完全没活时（没有待处理的上一批结果、没有待 prefill 的请求、也没有在 decode 的请求），它才以阻塞模式调用，意思是「没消息就一直等」。服务模式下，这时进程会停在 socket 上等新请求；离线模式下不会再有新请求了，如果 `pending_requests` 也空了，就抛出异常结束循环。
+
+还有一个容易漏看的细节：每次调用最多只取出总长度到 `prefill_budget`（默认等于 `max_extend_tokens`，8,192）为止的请求。剩下的留在 `pending_requests` 里，下一轮再取。一次 `generate` 送进几千个请求时，它们是分好几轮陆续进入调度器的。
+
+<SrcCode path="llm/llm.py" sym="LLM.offline_send_result" />
+
+收结果时，因为采到 EOS 而结束的那条消息，它的 token 就是 EOS 本身，不放进输出。
+
+<Mermaid
+  caption="离线模式下一次 generate 的流程。循环体就是调度器的主循环，下一章之后会逐步拆开。"
+  code={`sequenceDiagram
+    participant U as 用户脚本
+    participant L as LLM（也是 Scheduler）
+    participant E as Engine
+    U->>L: generate(prompts, params)
+    L->>L: 放进 pending_requests
+    loop run_forever 的每一轮
+        L->>L: offline_receive_msg 取出 UserMsg
+        L->>L: 选出一批请求，准备张量
+        L->>E: forward_batch
+        E-->>L: 采样出的 token
+        L->>L: offline_send_result 记下 token
+    end
+    L->>L: 没活了，阻塞接收时抛出 RequestAllFinished
+    L-->>U: 解码并返回结果`}
+/>
+
+### 调试之前，先关掉两样东西
+
+默认配置下直接打断点，会遇到两个麻烦：断点的先后顺序和你以为的不一样，而且 decode 阶段的断点根本进不了模型代码。原因分别是 overlap 调度和 CUDA graph。
+
+**第一样：overlap 调度。** 默认的主循环是 `overlap_loop`：发射第 N+1 批之后，才回头处理第 N 批的结果（<StageLink id="s5" />）。单步时，你看到的「收尾」处理的总是上一批。用环境变量换成顺序执行的 `normal_loop`：
+
+<SrcCode path="scheduler/scheduler.py" sym="Scheduler.run_forever" mark={['if ENV.DISABLE_OVERLAP_SCHEDULING:']} />
+
+变量名由 `env.py` 拼出来：前缀 `MINISGL_` 加上类属性名。
+
+<SrcCode path="env.py" sym="EnvClassSingleton" from="# backend runtime" to="PYNCCL_MAX_BUFFER_SIZE" mark="DISABLE_OVERLAP_SCHEDULING" />
+
+所以完整的名字是 `MINISGL_DISABLE_OVERLAP_SCHEDULING`，取值 `1`、`true`、`yes`（不分大小写）都表示打开。注意 `ENV` 是在第一次导入 `minisgl.env` 时读环境变量的（`from minisgl.llm import LLM` 会连带导入它），要在命令行里设，或者在脚本里 import 之前写进 `os.environ`，import 之后再设就晚了：
+
+```bash
+MINISGL_DISABLE_OVERLAP_SCHEDULING=1 python run_llm.py
+```
+
+**第二样：CUDA graph。** decode 批的大小不超过录过的最大 batch 时，引擎不调用 `model.forward()`，而是 replay 录好的 graph，Python 的模型代码一行都不执行，打在模型里的断点当然停不下来。把 `cuda_graph_max_bs` 设成 0 就不录了：
+
+<SrcCode path="engine/graph.py" sym="_determine_cuda_graph_bs" mark={['if cuda_graph_max_bs < 1:']} />
+
+返回空列表后，`GraphRunner` 的 `max_graph_bs` 是 0，日志里会打出 `CUDA graph is disabled.`，`can_use_cuda_graph` 对任何 batch 都返回 False，每一步都走 `model.forward()`。两个细节：
+
+- 如果同时显式传了 `cuda_graph_bs`，它的优先级更高，`cuda_graph_max_bs` 不起作用。
+- 设成 1 这样的小值不够：1、2、4 这三个大小是写死的，设成 1 照样会录这三个 graph，4 个请求以内的 decode 批都走 graph。想单步进模型代码，就设 0。
+
+不关 graph 时，创建 `LLM` 的过程中录 graph 也会执行模型代码（每个 batch 大小先正常跑一次，再在录制模式下跑一次）。在录制过程中停下来查看张量的值，会触发同步操作，CUDA 不允许在录制时同步，程序会报错。所以要在模型代码里下断点，最好关掉 graph。
+
+### 在哪里下断点
+
+按一个请求经过的顺序，推荐这几处：
+
+| 位置 | 看什么 |
+| --- | --- |
+| <Src path="llm/llm.py" sym="LLM.offline_receive_msg" /> | prompt 被分词、包成 `UserMsg` |
+| <Src path="scheduler/scheduler.py" sym="Scheduler._process_one_msg" /> | 长度检查，放进 prefill 的等待队列 |
+| <Src path="scheduler/scheduler.py" sym="Scheduler._schedule_next_batch" /> | 这一轮选出的是 prefill 批还是 decode 批 |
+| <Src path="scheduler/scheduler.py" sym="Scheduler._prepare_batch" /> | 分配 KV 槽位，准备 `positions`、`out_loc` 等张量 |
+| <Src path="engine/engine.py" sym="Engine.forward_batch" /> | 走 graph 还是 `model.forward()`；`complete_one` 前后长度的变化 |
+| <Src path="models/qwen3.py" sym="Qwen3ForCausalLM.forward" /> | 模型前向的入口（关掉 graph 后 decode 也能停下） |
+| <Src path="scheduler/scheduler.py" sym="Scheduler._process_last_data" /> | 判断是否结束，释放资源 |
+| <Src path="llm/llm.py" sym="LLM.offline_send_result" /> | token 进入输出 |
+
+用 VS Code 的话，`launch.json` 里把环境变量写上，并关掉 `justMyCode`，否则进不了已安装包里的代码（可编辑安装时一般没问题，但 PyTorch、FlashInfer 的代码会被跳过）：
+
+```json
+{
+  "name": "minisgl LLM",
+  "type": "debugpy",
+  "request": "launch",
+  "program": "${workspaceFolder}/run_llm.py",
+  "env": { "MINISGL_DISABLE_OVERLAP_SCHEDULING": "1" },
+  "justMyCode": false
+}
+```
+
+另外，环境变量 `LOG_LEVEL=DEBUG` 会打开调试日志，能看到每个收到的请求（<Src path="utils/logger.py" sym="init_logger" />）。
+
+### 同一个 prompt，两次输出不一样
+
+用最小配置，连续三次 `generate` 同一个 prompt（贪心解码、`max_tokens=16`），分别用默认的 radix 前缀缓存和 `cache_type="naive"`：
+
+<Aside type="note" title="实测：前缀缓存改变了输出">
+在 RTX 4080 SUPER 上：
+
+| 第几次 | radix 的输出 | naive 的输出 |
+| --- | --- | --- |
+| 1 | ` Paris. The capital of France is also the capital of the Republic of France.` | 同左 |
+| 2 | ` Paris. The capital of Italy is Rome. The capital of Spain is Madrid.` | ` Paris. The capital of France is also the capital of the Republic of France.` |
+| 3 | 同第 2 次 | 同第 2 次 |
+</Aside>
+
+贪心解码没有随机性，naive 模式三次完全一样。radix 模式第 2 次命中了第 1 次留在前缀缓存里的 KV，prefill 只算没命中的部分，计算的形状变了，bfloat16 下的数值有微小差异，贪心解码在某一步选了另一个 token。最后这一步是推断，没有逐层比对过。前缀缓存怎么命中、`evictable` 这些数字怎么算，见 <StageLink id="s6" />。
+
+这对调试的启发是：**要对比输出，就在同一个进程里用 `cache_type="naive"`，或者每次都新开一个进程。**
+
+### 冷启动和热启动
+
+<Aside type="note" title="实测：默认配置，第一次运行和之后的运行">
+在 RTX 4080 SUPER 上用默认配置，prompt 是一条 20 个 token 的对话，生成 73 个 token：
+
+| | 冷启动 | 热启动 |
+| --- | --- | --- |
+| 创建 `LLM` | 41.25 s | 5.78 s |
+| 第一次 `generate` | 13.23 s | 0.235 s |
+| 第二次 `generate` | 0.208 s | 0.216 s |
+</Aside>
+
+冷启动慢在 FlashInfer 的 JIT 编译：录 CUDA graph 时编译了 `rope` 和 `silu_and_mul`，第一个请求的 prefill 又编译了 `batch_prefill_with_kv_cache`。编译结果缓存在 `~/.cache/flashinfer`，之后就快了。加载权重本身只用了 1.5 s。所以第一次跑脚本时卡住几十秒是正常的，不要急着按 Ctrl+C。JIT 编译的细节见 <StageLink id="s10" />。
+
+### 服务模式和 shell 模式
+
+`python -m minisgl --model "Qwen/Qwen3-0.6B"` 启动 OpenAI 兼容的 HTTP 服务，加上 `--shell` 进入终端里的对话模式。这两种模式都会起多个进程，用 ZeroMQ 通信，调试起来麻烦得多，先用 `LLM` 把调度和模型读懂，再去看 <StageLink id="s8" />。
+
+## 常见误区
+
+- **「`LLM` 是一套简化过的调度逻辑」**：不是。它继承 `Scheduler`，只换了收发消息的两个方法，调度器、引擎、缓存的代码和服务模式完全一样。
+- **「脚本里 import 之后再设 `os.environ["MINISGL_DISABLE_OVERLAP_SCHEDULING"]` 也行」**：`ENV` 在第一次导入 `minisgl.env` 时就读完了环境变量，之后再设不起作用。
+- **「`cuda_graph_max_bs=1` 就能单步进模型」**：只有 1 个请求时 decode 批大小是 1，照样用 graph。要设成 0。
+- **「贪心解码，同一个 prompt 的输出一定一样」**：开着 radix 前缀缓存时，命中缓存会改变计算形状，输出可能不同（上面有实测）。
+- **「可以在一个脚本里先后创建两个 `LLM` 对比参数」**：全局 `Context` 只能设置一次，引擎也要求创建前 CUDA 没初始化。对比不同参数要分开进程跑。
+
+## 自测题
+
+1. `LLM` 是怎么绕开 tokenizer 进程和 ZeroMQ 的？
+
+   <Answer>
+   它以 `offline_mode=True` 构造 `SchedulerConfig`。`SchedulerIOMixin.__init__` 看到这个标志，就把 `receive_msg` 和 `send_result` 指向 `LLM` 自己的 `offline_receive_msg` 和 `offline_send_result`，然后提前返回，不建任何 socket。`LLM` 在这两个方法里自己分词、自己收集输出。
+   </Answer>
+
+2. `run_forever` 是个死循环，`generate` 怎么返回？
+
+   <Answer>
+   所有请求都处理完后，调度器手上没活，以阻塞模式调用 `receive_msg`。`offline_receive_msg` 发现 `pending_requests` 也空了，就抛出 `RequestAllFinished`，`generate` 捕获这个异常，整理结果返回。
+   </Answer>
+
+3. 一次 `generate` 送进 100 个 prompt，每个 1,000 个 token。它们是一次全部进入调度器的吗？
+
+   <Answer>
+   不是。`offline_receive_msg` 每次只取到累计长度达到 `prefill_budget`（默认 8,192）为止：前 8 个加起来 8,000，还没到，取第 9 个后变成 9,000，下一次循环才停。所以每轮最多取 9 个，其余留在 `pending_requests` 里，后面几轮再取。
+   </Answer>
+
+4. 关 overlap 的环境变量叫什么？为什么要在 import `minisgl` 之前设？
+
+   <Answer>
+   `MINISGL_DISABLE_OVERLAP_SCHEDULING`，名字是 `env.py` 里的前缀 `MINISGL_` 加类属性名。`ENV = EnvClassSingleton()` 在模块导入时执行，构造函数里读环境变量，之后不会再读。
+   </Answer>
+
+5. 为什么 decode 阶段打在模型代码里的断点停不下来？怎么办？
+
+   <Answer>
+   decode 批的大小不超过 `max_graph_bs` 时，`Engine.forward_batch` 用 `graph_runner.replay` 重放录好的 CUDA graph，不执行 Python 的模型代码。把 `cuda_graph_max_bs` 设成 0（并且不传 `cuda_graph_bs`），`_determine_cuda_graph_bs` 返回空列表，就每一步都走 `model.forward()`。
+   </Answer>
+
+6. 用最小脚本（`max_tokens=16`、输出没有提前遇到 EOS）、关掉 overlap 单步，一个请求会经过几次 `Engine.forward_batch`？各是什么批？
+
+   <Answer>
+   16 次：1 次 prefill，采样出第 1 个 token；15 次 decode，每次再出 1 个。
+   </Answer>
+
+7. 采到 EOS 结束的请求，输出里有 EOS 吗？
+
+   <Answer>
+   没有。`offline_send_result` 遇到 `finished` 为真、并且 token 等于 `eos_token_id` 的消息，就不把它放进 `output_ids`。
+   </Answer>
+
+8. 进阶：开着 overlap 时，一个以 EOS 结束的请求，输出里会不会多出东西？
+
+   <Answer>
+   可能会。overlap 模式下 CPU 发射下一批时还不知道上一批采到了 EOS，已经结束的请求会被多算一步，这一步的 token 会以 `finished=False` 发出来，于是被当作正常输出追加到 EOS 之后（EOS 本身被去掉了）。<StageLink id="s5" /> 的实测里，「1+1 等于几」的回答在开 overlap 时是 `'1\n'`，关掉后是 `'1'`。
+   </Answer>
+
+## 动手实验
+
+<Steps>
+
+1. **跑通最小脚本，并计时。** 在 `LLM(...)` 和 `generate` 前后加上 `time.perf_counter()`，打印两段耗时。第一次运行之前如果想看冷启动，先删掉 `~/.cache/flashinfer`。运行两次，对照上面的实测，找出日志里 FlashInfer 编译的那几行、KV 池大小那一行和录 CUDA graph 的那几行。
+
+2. **在调试器里跟一个请求。** 把脚本里的 `cuda_graph_max_bs` 改成 0，用 `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` 启动调试，在上面表格的几个位置下断点。数一数 `Engine.forward_batch` 停了几次，每次 `batch.phase` 是什么，和自测题 6 的答案对一下。在 `Qwen3ForCausalLM.forward` 停下时，看 `get_global_ctx().batch.input_ids` 的长度：prefill 时是多少，decode 时是多少？
+
+3. **打印每一步的结果，比较两种循环。** 在 `Scheduler._process_last_data` 里 `reply.append(...)` 之后加一行：
+
+   ```python
+   print(batch.phase, req.uid, next_token, finished)
+   ```
+
+   分别在开、关 overlap 时运行最小脚本，观察两种模式下各打印了几行、内容是否一致。再在 `Scheduler._forward` 开头加一行 `print("launch", forward_input.batch.phase)`，比较两种模式下 `launch` 和结果那一行交错的顺序有什么不同。
+
+4. **复现前缀缓存造成的差异。** 在最小配置下连续 `generate` 同一个 prompt 三次，每次之后打印 `llm.cache_manager.prefix_cache.size_info.evictable_size`；再加上 `cache_type="naive"` 新开一个进程重复一遍。对照上面实测表里的输出，把 `evictable` 的变化记下来，留到 <StageLink id="s6" /> 解释。
+
+</Steps>
+
+## 过关标准
+
+- 能不看代码说出 `generate` 从放进请求到返回结果经过的几步，以及循环靠什么结束。
+- 能说出调试时要设的环境变量和参数，以及各自关掉了什么。
+- 能在调试器里停在一个请求的 prefill 批和 decode 批上，并指出这时模型的输入有几个 token。

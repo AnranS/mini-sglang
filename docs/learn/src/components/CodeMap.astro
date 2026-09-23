@@ -1,0 +1,111 @@
+---
+// Package-by-package map of python/minisgl with line counts computed at build time.
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import path from 'node:path';
+import InlineCode from './InlineCode.astro';
+import { STAGE_BY_ID } from '../data/stages.mjs';
+import { REPO_ROOT, SOURCE_INFO } from '../lib/source.mjs';
+import { pageUrl } from '../lib/urls';
+
+const PKG = 'python/minisgl';
+
+const GROUPS: { dir: string; label?: string; desc: string; stages: string[] }[] = [
+	{ dir: '.', label: 'core.py 等', desc: '`Req`、`Batch`、`Context` 三个核心数据结构，环境变量开关', stages: ['s2'] },
+	{ dir: 'llm', desc: '单进程离线推理入口 `LLM`，直接继承 `Scheduler`', stages: ['s1'] },
+	{ dir: 'scheduler', desc: '调度主循环、prefill 准入、decode 集合、两张二维表、KV 页分配', stages: ['s2', 's5'] },
+	{ dir: 'engine', desc: '把模型、KV 池、attention 后端、CUDA graph、采样器组装起来', stages: ['s4', 's7'] },
+	{ dir: 'models', desc: 'Llama、Mistral、Qwen2、Qwen3、Qwen3-MoE 的结构定义与权重加载', stages: ['s3'] },
+	{ dir: 'layers', desc: '线性层、RMSNorm、RoPE、embedding / LM head、attention 层', stages: ['s3'] },
+	{ dir: 'kvcache', desc: 'KV 显存池，以及 radix / naive 两种前缀缓存', stages: ['s4', 's6'] },
+	{ dir: 'attention', desc: 'FlashInfer、FlashAttention、TensorRT-LLM 三种后端和混合后端', stages: ['s7'] },
+	{ dir: 'tokenizer', desc: '分词 / 反分词 worker 进程', stages: ['s8'] },
+	{ dir: 'message', desc: '进程间消息的定义和序列化', stages: ['s8'] },
+	{ dir: 'server', desc: '命令行参数、启动子进程、FastAPI 服务与交互 shell', stages: ['s8'] },
+	{ dir: 'utils', desc: 'ZeroMQ 队列、日志、HF 下载、架构检测等工具', stages: ['s8'] },
+	{ dir: 'distributed', desc: '张量并行的通信原语（all-reduce / all-gather）', stages: ['s9'] },
+	{ dir: 'kernel', desc: 'JIT 编译的 CUDA kernel、PyNCCL、Triton MoE kernel', stages: ['s4', 's10'] },
+	{ dir: 'moe', desc: 'MoE 专家路由与融合计算', stages: ['s10'] },
+	{ dir: 'benchmark', desc: '在线压测客户端和计时工具', stages: ['s10'] },
+];
+
+function countLines(abs: string) {
+	const text = readFileSync(abs, 'utf8');
+	return text.length === 0 ? 0 : text.split('\n').length - (text.endsWith('\n') ? 1 : 0);
+}
+
+function stats(dir: string) {
+	const root = path.join(REPO_ROOT, PKG, dir);
+	let files = 0;
+	let lines = 0;
+	const walk = (d: string, recurse: boolean) => {
+		for (const name of readdirSync(d)) {
+			const abs = path.join(d, name);
+			if (statSync(abs).isDirectory()) {
+				if (recurse && name !== '__pycache__') walk(abs, true);
+			} else if (name.endsWith('.py')) {
+				files += 1;
+				lines += countLines(abs);
+			}
+		}
+	};
+	walk(root, dir !== '.');
+	return { files, lines };
+}
+
+const rows = GROUPS.map((g) => ({
+	...g,
+	...stats(g.dir),
+	url: `${SOURCE_INFO.treeBase}${PKG}${g.dir === '.' ? '' : `/${g.dir}`}`,
+}));
+const total = rows.reduce((acc, r) => ({ files: acc.files + r.files, lines: acc.lines + r.lines }), {
+	files: 0,
+	lines: 0,
+});
+const fmt = (n: number) => n.toLocaleString('en-US');
+---
+<div class="table-scroll">
+	<table class="code-map">
+		<thead>
+			<tr>
+				<th>目录</th>
+				<th class="num">文件</th>
+				<th class="num">行数</th>
+				<th>负责什么</th>
+				<th>阶段</th>
+			</tr>
+		</thead>
+		<tbody>
+			{
+				rows.map((r) => (
+					<tr>
+						<td>
+							<a class="src-ref" href={r.url} target="_blank" rel="noopener">
+								<code>{r.label ?? `${r.dir}/`}</code>
+							</a>
+						</td>
+						<td class="num">{r.files}</td>
+						<td class="num">{fmt(r.lines)}</td>
+						<td>
+							<InlineCode text={r.desc} />
+						</td>
+						<td class="stage-refs">
+							{r.stages.map((id) => (
+								<a href={pageUrl(STAGE_BY_ID[id].slug)} title={`阶段 ${STAGE_BY_ID[id].n} · ${STAGE_BY_ID[id].title}`}>
+									{STAGE_BY_ID[id].n}
+								</a>
+							))}
+						</td>
+					</tr>
+				))
+			}
+		</tbody>
+		<tfoot>
+			<tr>
+				<td>合计</td>
+				<td class="num">{total.files}</td>
+				<td class="num">{fmt(total.lines)}</td>
+				<td colspan="2">统计自提交 <code>{SOURCE_INFO.shortSha}</code> 的 <code>python/minisgl</code>，含空行和注释</td>
+			</tr>
+		</tfoot>
+	</table>
+</div>

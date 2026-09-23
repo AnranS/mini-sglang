@@ -1,0 +1,83 @@
+---
+// CPU / GPU lanes on a shared time axis. `at` and `len` are in abstract units;
+// one unit is too narrow for more than a short label, so one-unit blocks
+// usually carry only a batch number and rely on the legend for their meaning.
+//   <Timeline span={14} groups={[
+//     { title: 'normal_loop', rows: [
+//       { label: 'CPU', blocks: [{ at: 0, len: 1, text: '1', kind: 'schedule' }] },
+//       { label: 'GPU', blocks: [{ at: 1, len: 4, text: '前向 1', kind: 'gpu' }] },
+//     ] },
+//   ]} caption="..." />
+type Kind = 'schedule' | 'finish' | 'gpu' | 'wait' | 'idle';
+type Block = { at: number; len: number; text: string; kind: Kind };
+type Row = { label: string; blocks: Block[] };
+type Group = { title?: string; rows: Row[] };
+
+interface Props {
+	span: number;
+	groups: Group[];
+	legend?: Partial<Record<Kind, string>>;
+	caption?: string;
+}
+
+const LEGEND: Record<Kind, string> = {
+	schedule: '调度第 N 批',
+	finish: '收尾第 N 批（处理结果）',
+	gpu: 'GPU 前向',
+	wait: 'CPU 等 GPU',
+	idle: 'GPU 空闲',
+};
+
+const { span, groups, legend = {}, caption } = Astro.props;
+for (const group of groups) {
+	for (const row of group.rows) {
+		for (const b of row.blocks) {
+			if (!(b.kind in LEGEND)) throw new Error(`Timeline: 未知的 kind「${b.kind}」`);
+			if (b.at < 0 || b.len <= 0 || b.at + b.len > span) {
+				throw new Error(`Timeline: 「${b.text}」超出了时间轴 [0, ${span}]`);
+			}
+		}
+	}
+}
+const used = new Set(groups.flatMap((g) => g.rows.flatMap((r) => r.blocks.map((b) => b.kind))));
+const legendItems = (Object.keys(LEGEND) as Kind[])
+	.filter((kind) => used.has(kind))
+	.map((kind) => ({ kind, label: legend[kind] ?? LEGEND[kind] }));
+---
+<figure class="timeline not-content" style={`--span: ${span}`}>
+	{
+		groups.map((group) => (
+			<div class="timeline-group">
+				{group.title && <p class="timeline-title">{group.title}</p>}
+				{group.rows.map((row) => (
+					<div class="timeline-row">
+						<span class="timeline-label">{row.label}</span>
+						<div class="timeline-track">
+							{row.blocks.map((b) => (
+								<span
+									class="timeline-block"
+									data-kind={b.kind}
+									style={`--at: ${b.at}; --len: ${b.len}`}
+									title={`${legend[b.kind] ?? LEGEND[b.kind]}：${b.text}`}
+								>
+									{b.text}
+								</span>
+							))}
+						</div>
+					</div>
+				))}
+			</div>
+		))
+	}
+	<ul class="timeline-legend">
+		{
+			legendItems.map(({ kind, label }) => (
+				<li>
+					<span class="timeline-swatch" data-kind={kind} aria-hidden="true" />
+					{label}
+				</li>
+			))
+		}
+	</ul>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>

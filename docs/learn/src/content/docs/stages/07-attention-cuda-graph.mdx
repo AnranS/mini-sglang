@@ -1,0 +1,292 @@
+---
+title: Attention 后端与 CUDA graph
+description: 后端接口的 5 个方法、FlashInfer 先 plan 再 run，以及 decode 的 CUDA graph 录制与 replay。
+sidebar:
+  order: 7
+  label: 7 · Attention 后端与 CUDA graph
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import Answer from '~/components/Answer.astro';
+import FileTable from '~/components/FileTable.astro';
+import Src from '~/components/Src.astro';
+import SrcCode from '~/components/SrcCode.astro';
+import StageHeader from '~/components/StageHeader.astro';
+import StageLink from '~/components/StageLink.astro';
+
+<StageHeader id="s7" />
+
+## 这一阶段要搞懂什么
+
+<StageLink id="s3" /> 里的 attention 层只做了 QKV 切分、norm 和 RoPE，最后一行把 q、k、v 交给 `ctx.attn_backend.forward`。真正从分页的 KV 池里读写 K/V、算 attention 的，是这一章的主角：attention 后端。它和 CUDA graph 放在一章，是因为两者纠缠在一起：CUDA graph 要求每次 replay 时指针固定，而 attention 恰恰是每一批形状都不同的那一层，后端必须专门配合。读完这一章，你应该能不看代码回答：
+
+- 后端接口的 5 个方法分别在什么时候、被谁调用？
+- FlashInfer 为什么要先 plan 再 run？plan 一批做几次？`last_event` 在防什么？
+- `attention_backend="auto"` 在不同计算能力的卡上会选什么？
+- CUDA graph 录制时，dummy 请求和哑页各起什么作用？replay 之前要把哪些东西搬进固定地址？
+- 哪些 batch 不能用 CUDA graph？关掉它会慢多少？
+
+## 精读清单
+
+<FileTable files={[
+  { path: 'attention/base.py', sym: 'BaseAttnBackend', note: '5 个方法，分成每批都调用的和只跟 graph 有关的两组' },
+  { path: 'engine/engine.py', sym: '_adjust_config', note: '`"auto"` 按什么选，选中 trtllm 时顺手改了什么' },
+  { path: 'attention/__init__.py', sym: 'create_attention_backend', note: '`"fa,fi"` 怎么变成 `HybridBackend`' },
+  { path: 'attention/fi.py', sym: 'FlashInferBackend.prepare_metadata', note: '为什么要留一份 CPU 上的长度' },
+  { path: 'attention/fi.py', sym: 'FlashInferBackend._initialize_metadata_once', note: 'plan 在哪个 stream 上发生，前后的 event 在等什么' },
+  { path: 'attention/fa.py', sym: 'FlashAttentionBackend.prepare_metadata', note: '二维页表是怎么从 `page_table` 切出来的' },
+  { path: 'engine/graph.py', sym: '_determine_cuda_graph_bs', note: '默认录哪些 batch size' },
+  { path: 'engine/graph.py', sym: 'GraphRunner._capture_graphs', note: '为什么从大到小录，录之前为什么先跑一遍' },
+  { path: 'engine/graph.py', sym: 'GraphRunner.replay', note: 'replay 前要搬什么' },
+  { path: 'engine/engine.py', sym: 'Engine.forward_batch', note: '什么时候走 graph，什么时候走普通前向' },
+]} />
+
+## 讲解
+
+### 接口：5 个方法，两组用途
+
+<SrcCode path="attention/base.py" sym="BaseAttnBackend" />
+
+5 个方法分成两组。前两个每一批都会用到：
+
+| 方法 | 谁调用 | 什么时候 |
+| --- | --- | --- |
+| `prepare_metadata` | `Scheduler._prepare_batch` | 每批发射前一次，把请求的长度、页表翻译成 kernel 要的参数，存进 `batch.attn_metadata`。长度在 CPU 上算，从页表里取页号是在调度器 stream 上发的 GPU 操作 |
+| `forward` | 每个 `AttentionLayer` | 每批每层一次：先把这一层新的 K/V 写进 KV 池，再算 attention |
+
+后三个只和 CUDA graph 有关：
+
+| 方法 | 谁调用 | 什么时候 |
+| --- | --- | --- |
+| `init_capture_graph` | `GraphRunner._capture_graphs` | 启动时一次，按最大的 batch size 分配 graph 要用的固定缓冲区 |
+| `prepare_for_capture` | 同上 | 每录一个 batch size 一次，造一份指向固定缓冲区的 metadata |
+| `prepare_for_replay` | `GraphRunner.replay` | 每次 replay 前，把这一批真实的 metadata 搬进固定缓冲区 |
+
+metadata 还要实现一个 `get_last_indices`：prefill 批里每个请求只需要最后一个位置的 logits，LM head（<Src path="layers/embedding.py" sym="ParallelLMHead.forward" />）用它从所有 token 里挑出这些位置。
+
+三个后端的 `forward` 开头都是同一句 `self.kvcache.store_kv(k, v, batch.out_loc, layer_id)`：新 token 的 K/V 写到 `out_loc` 指定的槽位（<StageLink id="s4" /> 讲过它是怎么来的），然后再读整段 KV 算 attention。所以写 KV 和算 attention 都归后端管，模型层完全不知道 KV 池的存在。
+
+### 选哪个后端：`"auto"` 和 `"fa,fi"`
+
+<SrcCode path="engine/engine.py" sym="_adjust_config" />
+
+`"auto"` 按计算能力选，判断函数是 <Src path="utils/arch.py" sym="is_arch_supported" />，比较的是「不低于」：
+
+| 计算能力 | 选中的后端 | 典型的卡 |
+| --- | --- | --- |
+| 不低于 10.0 | `"trtllm"` | Blackwell 数据中心卡；RTX 50 系是 12.x，也落在这里 |
+| 9.x | `"fa,fi"`：prefill 用 FlashAttention，decode 用 FlashInfer | H100、H200 |
+| 更低 | `"fi"` | A100、RTX 30 / 40 系 |
+
+实测用的 RTX 4080 SUPER 是 8.9，所以选的是 `"fi"`，[实测记录](../../appendix/measurements/)里的所有数字都来自 FlashInfer 后端。选中 trtllm 时，如果 `page_size` 不是 16、32、64 之一，会被强行改成 64，所以看显存和页数时要以日志为准。
+
+<Aside type="caution" title="RTX 50 系会被选成 trtllm，能不能用需要自己确认">
+`is_sm100_supported()` 只判断计算能力不低于 10.0，RTX 50 系（12.x）也满足，于是会选 `"trtllm"`。这个后端调用的是 FlashInfer 里的 TensorRT-LLM kernel，它们在消费级 Blackwell 卡上能不能跑，本站没有验证。如果在这类卡上启动失败或者结果不对，先手动指定 `attention_backend="fi"` 对照。
+</Aside>
+
+<SrcCode path="attention/__init__.py" sym="create_attention_backend" />
+
+带逗号的写法表示「prefill 用前一个，decode 用后一个」。两个不同时，包成 <Src path="attention/base.py" sym="HybridBackend" />：`forward` 和 `prepare_metadata` 按 `batch.is_prefill` 转给对应的后端，三个 graph 方法一律转给 decode 后端，因为只有 decode 录 graph。两个相同（比如 `"fi,fi"`）时打一条警告，退化成单个后端。
+
+### FlashInfer：先 plan 再 run
+
+<SrcCode path="attention/fi.py" sym="FlashInferBackend.prepare_metadata" />
+
+这里准备的东西有两个特点：
+
+- **长度留在 CPU 上。** `cu_seqlens_k_cpu`、`seq_lens_cpu` 等都是 pinned memory 上的 CPU 张量，只有 `cu_seqlens_q` 另拷了一份到 GPU（给 `get_last_indices` 用）。原因在下面的 plan。
+- **页大小固定为 1。** `indices` 把每个请求 `page_table[table_idx, : device_len]` 拼成一维，里面是每个 token 的槽位；`forward` 里再把 KV 池的每一层 view 成「每页 1 个 token」的形状。所以不管系统的 `page_size` 是多少，FlashInfer 看到的都是逐 token 的索引。实测的 benchmark 配置用 `page_size=256`，走的就是这条路。
+
+`cu_seqlens_q` 分三种情况：decode 时每个请求只有 1 个新 token，直接是 `0, 1, 2, …`；prefill 且没有命中前缀缓存时，新 token 数就是总长度，和 `cu_seqlens_k` 相同；命中了前缀缓存时两者不同，要单独算。
+
+<SrcCode path="attention/fi.py" sym="FlashInferBackend._initialize_metadata_once" mark={['self.last_event.synchronize()', 'self.last_event.record()']} />
+
+FlashInfer 把一次 attention 拆成两步：
+
+- **plan**：在 CPU 上根据这一批每个请求的长度，决定怎么把工作分给 GPU 上的线程块（比如一个很长的请求要不要把 KV 切成几段并行算、最后再合并），把这份调度表写进 workspace。它要读每个请求的长度，这就是长度要留在 CPU 上的原因：如果只有 GPU 上的一份，plan 每次都得先同步拷回来。
+- **run**：按调度表发射 kernel，真正算 attention。
+
+同一批里 28 层的长度完全一样，调度表也一样，所以 plan 一批只做一次，run 每层做一次。`metadata.initialized` 就是这个「只做一次」的开关：第一层的 `forward` 调用 `_initialize_metadata_once` 时 plan，之后的层直接跳过。
+
+为什么 plan 不在 `prepare_metadata` 里做，而是拖到第一层 `forward` 时？代码没写原因，下面是推断。`prepare_metadata` 在调度器的 stream 上跑，而 plan 会往 GPU 上的 int workspace 里拷调度表。这块 workspace 是所有 wrapper 共用的（`__init__` 里那段 `NOTE: some hack`，graph 用的 wrapper 也是同一块）。overlap 模式下，调度器准备第 N+1 批时，第 N 批可能还在引擎 stream 上读这块 workspace。把 plan 放进 `forward`，拷贝就排在引擎 stream 上、第 N 批之后，天然不会冲突。
+
+### `last_event`：CPU 跑得太快时的保护
+
+plan 里还藏着一个更隐蔽的竞争，要看 FlashInfer 的实现才能看出来（以实测用的 FlashInfer 0.7.0 为准）：
+
+1. 每个 wrapper 有一块自己的 pinned memory 缓冲区 `_pin_memory_int_workspace_buffer`。plan 在 C++ 里把调度表写进这块 CPU 内存。
+2. 写完后调用 `cudaMemcpyAsync`，把它异步拷到 GPU 上的 int workspace，拷贝排在当前 stream 上。
+3. 异步拷贝是在 GPU **执行到**这一项时才去读 CPU 内存的，不是调用时。
+
+overlap 模式下 CPU 领先 GPU（<StageLink id="s5" />）。连续两批 decode 用的是同一个 wrapper，如果第 N+1 批的 plan 在第 N 批的拷贝真正执行之前就改写了这块 CPU 内存，第 N 批拷到 GPU 上的就是第 N+1 批的调度表，第 N 批会按错误的调度表去算：轻则结果不对，重则越界访问。
+
+PyTorch 自己分配的 pinned 张量不怕这个：它的 caching host allocator 会在 `non_blocking` 拷贝上记录 event，拷贝完成前不会把这块内存再分出去。`prepare_metadata` 里每批新建的那些 CPU 张量就靠这个保护。但 FlashInfer 这块缓冲区是长期持有、由 C++ 直接改写的，PyTorch 管不到，只能手动同步：
+
+- plan 之后 `last_event.record()`：在引擎 stream 上、这次拷贝的后面打一个标记。
+- 下一次 plan 之前 `last_event.synchronize()`：CPU 等到上一个标记执行过，也就是上一批的拷贝已经完成，再改写缓冲区。
+
+代价是 CPU 要等 GPU 执行完上一批 plan 的那次拷贝才能继续：非 graph 的批，这次拷贝排在第一层 attention 之前；graph 批排在 replay 之前。顺序执行时，每批收尾都会等 GPU 把这一批算完，下一次 plan 时上一次的拷贝早就完成了，这个等待几乎不会真的阻塞，所以它主要在 overlap 模式下起作用。这段代码是 commit `20fcd7f`（上游 #103，标题是「Fix race condition in flashinfer backend」）加的。同一个提交还删掉了环境变量 `OVERLAP_EXTRA_SYNC`：打开它时，每批前向之前会同步一次调度器 stream，代码注释指向上游 issue #58。从两者在同一个提交里一增一删来看，它们针对的应该是同一个问题，这一点是推断。
+
+### FA 和 TensorRT-LLM 后端
+
+<SrcCode path="attention/fa.py" sym="FlashAttentionBackend.prepare_metadata" from="page_table = get_global_ctx().page_table" to="new_page_table.div_" />
+
+FA 和 trtllm 两个后端的 metadata 几乎一样，和 FlashInfer 有两点不同：
+
+- **二维页表。** 全局的 `page_table` 存的是逐 token 的槽位；每隔 `page_size` 列取一个，再整除 `page_size`，就得到每个请求的页号列表，拼成 `[batch, 页数]` 的二维表。kernel 按页读 KV，所以这两个后端真正用上了 `page_size`。
+- **没有 plan。** 长度直接拷到 GPU 上，kernel 自己处理调度，也就没有 `last_event` 那样的问题。
+
+FA 后端调的是 `sgl_kernel` 里的 `flash_attn_with_kvcache`，计算能力不低于 10.0 时传 `ver=4`，否则传 3。trtllm 后端调的是 FlashInfer 里的 `trtllm_batch_context_with_kv_cache`（prefill）和 `trtllm_batch_decode_with_kv_cache`（decode）。这两个后端本站都没有在实测的卡上跑过。
+
+### CUDA graph 录哪些 batch size
+
+先回顾一下 CUDA graph 的想法（<StageLink id="s0" />）：把一整段 kernel 的发射录下来，之后一次 replay 就把它们全部排进 stream，省掉 Python 和 kernel launch 的开销。代价是录下来的 kernel 参数（包括指针）全部固定。decode 每一步的 GPU 计算很短，发射开销占比大，最值得录；而且 decode 每个请求只有 1 个 token，形状只由 batch size 决定。
+
+<SrcCode path="engine/graph.py" sym="_determine_cuda_graph_bs" />
+
+- 显式给了 `cuda_graph_bs` 列表就照用（这个字段只能在 Python 里通过配置传，命令行只有 `--cuda-graph-max-bs`）。
+- 没给 `cuda_graph_max_bs` 时，加载模型前的空闲显存超过 80 GiB 就录到 256，否则录到 160。
+- 列表是 `1, 2, 4`，再加上 8 的倍数一直到上限。`cuda_graph_max_bs` 小于 1 时返回空列表，CUDA graph 关闭。
+
+实测：RTX 4080 SUPER 加载模型前空闲 14.67 GiB，默认录到 160，一共 **23 个**：1、2、4、8，然后 16 到 160 每隔 8 一个。最小配置 `cuda_graph_max_bs=8` 录 4 个，benchmark 配置 `cuda_graph_max_bs=256` 录 35 个。
+
+注意 `1, 2, 4` 是写死的：`cuda_graph_max_bs` 设成 1 到 7 之间的数，也至少录 1、2、4 这三个，最大的 graph 是 4，而不是你设的数。<StageLink id="s8" /> 里 shell 模式会把它设成 1，就属于这种情况。
+
+### dummy 请求和哑页
+
+<SrcCode path="engine/engine.py" sym="Engine.__init__" from="self.dummy_req = Req(" to="fill_(num_tokens)" />
+
+dummy 请求是一个长度为 1、还没算过任何 token 的假请求（`cached_len=0`、`device_len=1`），看起来就像一个普通的 decode 请求。它和别的请求不共用任何资源：
+
+- **表行**：`table_idx` 是 `max_running_req`，也就是 `page_table` 和 `token_pool` 的最后一行，<StageLink id="s2" /> 讲过这一行是专门留的。`token_pool` 初始化为全 0，所以它的输入 token 永远是 0，是一个合法的 token id。
+- **哑页**：KV 池分配了 `num_pages + 1` 页，多出来的最后一页（<StageLink id="s4" />）就是哑页，它第一个槽位的下标正好是 `num_tokens`。dummy 请求那一行 `page_table` 全部填成 `num_tokens`，于是它写 KV 写进哑页，读 KV 也只读哑页。
+
+它有两个用处。录制时，用 bs 个 dummy 请求拼一个 batch，让后端照常生成 metadata。运行时，真实的 decode 批要补齐到录过的某个大小，补的就是 dummy 请求（`pad_batch`）。补进来的那几行照样跑完整个模型，但读写都落在哑页上，碰不到任何真实请求的 KV，算出的 logits 也直接丢掉。
+
+### 录制
+
+<SrcCode path="engine/graph.py" sym="GraphRunner._capture_graphs" from="self.buffer = GraphCaptureBuffer.init" to="self.graph_map[bs] = graph" />
+
+逐条看：
+
+- **固定缓冲区。** `GraphCaptureBuffer` 按最大的 batch size 分配 `input_ids`、`out_loc`、`positions` 和 `logits`。`set_batch` 让 batch 的这几个字段变成缓冲区的切片，于是录下来的 kernel 读写的都是这几块固定地址。attention 自己的固定缓冲区（长度、页表）在 `init_capture_graph` 里分配。
+- **先跑一遍再录。** 每个大小先在 graph 外跑一次 `model.forward()`，把懒初始化的东西（JIT 编译、库的句柄、内存分配）都触发掉，免得它们被录进 graph。实测冷启动时，FlashInfer 的 `rope` 和 `silu_and_mul` 两个 JIT 模块就是在这一步编译的（<StageLink id="s10" />）。
+- **从大到小录，共用一个内存池。** 第一个（最大的）graph 录完后取出它的内存池，后面的 graph 都录进同一个池里。小 batch 需要的中间张量比大 batch 小，可以复用大 graph 已经占下的内存。实测默认配置录 23 个 graph，空闲显存从 0.82 GiB 降到 0.53 GiB，用掉约 0.29 GiB。其中 `logits` 缓冲区是 160 × 151,936（词表大小）× 4 字节，按形状算约 93 MiB。
+- **录制时写的是 0 号槽位。** `out_loc` 缓冲区初始是全 0，先跑的那一遍会把 dummy 请求的 K/V 写进 KV 池的 0 号槽位。这时还没有任何请求，所以无害；replay 时 `out_loc` 会被换成真实的值。
+
+只有 `model.forward()` 被录了进去，采样在 graph 外面，由 <Src path="engine/engine.py" sym="Engine.forward_batch" /> 在拿到 logits 之后单独做。
+
+### replay：之前要准备什么
+
+<SrcCode path="engine/engine.py" sym="Engine.forward_batch" />
+
+<SrcCode path="engine/graph.py" sym="GraphRunner.can_use_cuda_graph" />
+
+能走 graph 的只有一种 batch：**decode 批，而且真实请求数不超过录过的最大 batch size**。下面这些都走普通的 `model.forward()`：
+
+- 所有 prefill 批。prefill 的 token 数随请求变化，形状不固定，也没有为它录 graph。
+- 请求数超过最大 graph 大小的 decode 批，比如默认配置下一批有 161 个以上的 decode 请求。
+- `cuda_graph_max_bs=0` 时，一个 graph 都没录，`max_graph_bs` 是 0，任何 batch 都不满足条件。
+
+一批 decode 要走 graph，从调度器到 replay 一共要准备这些：
+
+<SrcCode path="engine/graph.py" sym="GraphRunner.pad_batch" />
+
+1. `_prepare_batch` 最先调用 `pad_batch`：在录过的大小里找第一个不小于真实请求数的，补 dummy 请求补到这个大小，结果放进 `batch.padded_reqs`。不能走 graph 的批不补。
+2. 之后的 positions、输入映射、`out_loc` 和 `prepare_metadata` 都按 `padded_reqs` 算，所以补进来的 dummy 请求也有完整的输入和 metadata。采样和写回 `token_pool` 只用 `batch.reqs`。
+3. `_forward` 按映射从 `token_pool` 取出 `input_ids`（<StageLink id="s5" />），然后进入 `forward_batch`。
+
+<SrcCode path="engine/graph.py" sym="GraphRunner.replay" />
+
+4. `copy_from`：把 `input_ids`、`out_loc`、`positions` 拷进固定缓冲区。
+5. `prepare_for_replay`：把 attention 的 metadata 搬进固定缓冲区。FA 和 trtllm 是三次拷贝（`cu_seqlens_k`、`seq_lens`、页表）；FlashInfer 换上为这个大小录制时建的 CUDA graph 版 wrapper，然后 plan，plan 会把 `indptr` 和 `indices` 拷进这个 wrapper 绑定的固定缓冲区，并把调度表写进 workspace。graph 里的 attention kernel 读的就是这几块地址。
+6. `graph.replay()`，取 `logits` 的前 `batch.size` 行。补进来的那些行直接丢掉。
+
+<Aside type="note" title="实测：关掉 CUDA graph 慢 8.5%">
+用 benchmark 配置（256 个请求，`ignore_eos=True`，总共生成 133,966 个 token），默认设置用时 31.27 s、吞吐 4,285 token/s；把 `cuda_graph_max_bs` 改成 0 后用时 34.17 s、吞吐 3,920 token/s，慢 8.5%。每组只跑了一次，会有几个百分点的波动。0.6B 的模型每一步 GPU 计算很短，发射开销占比大，CUDA graph 的收益在大模型上会小一些，这一点是推断，没有实测。
+</Aside>
+
+## 常见误区
+
+- **「CUDA graph 让 kernel 本身算得更快」**：kernel 还是那些 kernel，省的是 CPU 逐个发射它们的开销。补齐到更大的 batch 反而多算了几行无用功。
+- **「FlashInfer 每一层都要 plan 一次」**：一批只 plan 一次，28 层共用同一份调度表，`metadata.initialized` 保证这一点。
+- **「用 FlashInfer 后端时 `page_size` 必须是 1」**：只是 FlashInfer 看到的页大小是 1。系统的 `page_size` 可以是任意值，`forward` 会把 KV 池 view 成每页 1 个 token 的形状，`indices` 也是逐 token 的。
+- **「prefill 也能用 CUDA graph，只要补齐到固定长度」**：mini-sglang 只给 decode 录 graph，所有 prefill 批都走普通前向。
+- **「`"auto"` 选中的后端一定能在这张卡上跑」**：它只比较计算能力的大小，不检查这张卡、这个版本的库是否真的支持。
+
+## 自测题
+
+1. 后端接口的 5 个方法里，哪两个每批都会调用？另外三个分别在什么时候调用？
+
+   <Answer>
+   `prepare_metadata`（每批一次，`_prepare_batch` 里）和 `forward`（每批每层一次）。`init_capture_graph` 启动时调用一次，分配固定缓冲区；`prepare_for_capture` 每录一个 batch size 调用一次；`prepare_for_replay` 每次 replay 前调用，把真实 metadata 搬进固定缓冲区。
+   </Answer>
+
+2. FlashInfer 的 plan 做什么？为什么一批只做一次？为什么 metadata 要留一份 CPU 上的长度？
+
+   <Answer>
+   plan 根据每个请求的长度，在 CPU 上决定怎么把 attention 的工作分给线程块，把调度表写进 workspace；run 按调度表发射 kernel。同一批所有层的长度一样，调度表可以共用，所以只在第一层 plan，`metadata.initialized` 挡住后面的层。plan 要在 CPU 上读长度，留一份 CPU 上的就不用每次从 GPU 同步拷回来。
+   </Answer>
+
+3. 如果删掉 `_initialize_metadata_once` 里的 `last_event.synchronize()`，overlap 模式下可能出什么问题？为什么 PyTorch 自己不能防住？
+
+   <Answer>
+   plan 把调度表写进 wrapper 自带的 pinned 缓冲区，再异步拷到 GPU，拷贝在 GPU 执行到时才读 CPU 内存。CPU 领先时，第 N+1 批的 plan 可能在第 N 批的拷贝执行之前改写这块缓冲区，第 N 批就拿着第 N+1 批的调度表去算，结果错误甚至越界。PyTorch 的 caching host allocator 只保护它自己分配出去、用于 `non_blocking` 拷贝的内存；这块缓冲区是 FlashInfer 长期持有、由 C++ 直接改写的，PyTorch 不知道它什么时候被改。
+   </Answer>
+
+4. 下面几张卡在 `"auto"` 下分别选什么后端：RTX 4080 SUPER（8.9）、H100（9.0）、B200（10.0）、RTX 5090（12.0）？选中 trtllm 时还会发生什么？
+
+   <Answer>
+   依次是 `"fi"`、`"fa,fi"`、`"trtllm"`、`"trtllm"`。RTX 5090 也选 trtllm 是因为判断的是「不低于 10.0」，能否正常运行需要自己确认。选中 trtllm 时，如果 `page_size` 不是 16、32、64 之一，会被改成 64。
+   </Answer>
+
+5. 默认配置下，一批 decode 有 13 个请求，会补几个 dummy 请求？它们的 K/V 写到哪里？采样时它们会参与吗？
+
+   <Answer>
+   录过的大小是 1、2、4、8、16、24……，第一个不小于 13 的是 16，补 3 个。它们那一行 `page_table` 全是 `num_tokens`，`out_loc` 指向哑页，K/V 写进哑页，attention 也只读哑页。采样只用 `logits[: batch.size]`，它们不参与，也不会写回 `token_pool`。
+   </Answer>
+
+6. `cuda_graph_max_bs` 分别设成 0、3、8 时，各录哪些 batch size？
+
+   <Answer>
+   0：一个都不录，CUDA graph 关闭。3：`1, 2, 4`，因为这三个是写死的，`range(8, 4, 8)` 为空，最大的 graph 是 4。8：`1, 2, 4, 8`，和实测的最小配置一致。
+   </Answer>
+
+7. 录制为什么从最大的 batch size 开始？每个大小录之前为什么先在 graph 外跑一遍？
+
+   <Answer>
+   所有 graph 共用第一个 graph 的内存池。先录最大的，池子一开始就按最大的需求分好，后面小的 graph 需要的中间张量更小，可以复用这些内存，总占用更少。先跑一遍是为了触发 JIT 编译、库的句柄初始化、内存分配这类只发生一次的动作，不让它们被录进 graph。
+   </Answer>
+
+8. 进阶：FA 后端的 `prepare_for_replay` 只把页表拷进固定缓冲区的前 `table_len` 列，后面的列还留着上一次 replay 甚至录制时的旧值。为什么这不会出错？
+
+   <Answer>
+   kernel 按 `seq_lens` 决定每个请求读多少个 token，也就是只读页表的前 `ceil(seq_len / page_size)` 列，这些列都落在本次拷进去的 `table_len` 列之内（`table_len` 按这一批最长的请求算）。后面的旧值不会被读到。`seq_lens` 和 `cu_seqlens_k` 本身每次都会被覆盖。
+   </Answer>
+
+## 动手实验
+
+<Steps>
+
+1. **确认自己的卡选了什么。** 先查计算能力：
+
+   ```python
+   import torch
+   print(torch.cuda.get_device_capability())
+   ```
+
+   再用最小配置创建一个 `LLM`，在日志里找 `Auto-selected attention backend`（这一行只在 `attention_backend="auto"` 时出现，所以这次去掉 `attention_backend="fi"`）、`Start capturing CUDA graphs with sizes` 和录制前后的空闲显存。和实测记录对照：如果你的卡不是 8.9，选中的后端和录制的显存都会不同。
+
+2. **数一数 plan 了几次。** 在 `FlashInferBackend._initialize_metadata_once` 的 `metadata.initialized = True` 之后加一行，打印 `type(metadata.wrapper).__name__` 和 `len(metadata.seq_lens_cpu)`。用最小配置生成一个 5 个 token 的 prompt、`max_tokens=16`。先预测会打印几行（别忘了启动时录制的每个 graph 也会 plan 一次）、每行的 wrapper 是哪个类，再运行。然后把 `cuda_graph_max_bs` 改成 0 再跑一次，看 wrapper 的类有什么变化。
+
+3. **量一量 `last_event` 让 CPU 等了多久。** 在 `last_event.synchronize()` 前后用 `time.perf_counter()` 计时，累加到一个全局变量里，生成结束后打印总和与调用次数。用 benchmark 的负载（或者 64 个随机 prompt）分别在 overlap 开和 `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` 下跑，观察两种模式下等待时间的差别，想想为什么。
+
+4. **观察补齐和 graph 的开关。** 在 `GraphRunner.pad_batch` 里打印 `batch.phase`、`batch.size` 和补齐后的大小。用默认配置同时送进 13 个 prompt，确认 decode 批被补到 16、prefill 批不补。然后按实测记录的方法跑 `benchmark/offline/bench.py`，一次用默认参数，一次把 `cuda_graph_max_bs` 改成 0，对比吞吐和实测的 8.5%。
+
+</Steps>
+
+## 过关标准
+
+- 能不看代码说出后端 5 个方法各自的调用时机，以及 FlashInfer 的 plan 在哪一步、哪个 stream 上发生。
+- 能讲清楚 `last_event` 防的竞争：谁写了哪块内存、谁异步读它、为什么 overlap 模式下会撞上。
+- 能说出 dummy 请求和哑页的作用、replay 前要准备的每一样东西，以及哪些 batch 不能用 CUDA graph。

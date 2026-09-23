@@ -1,0 +1,19 @@
+---
+// Link to a stage by id, so pages never hard-code stage URLs.
+//   <StageLink id="s5" />            → 阶段 5 · 调度器
+//   <StageLink id="s5">调度器那一章</StageLink>
+import { STAGE_BY_ID } from '../data/stages.mjs';
+import { pageUrl } from '../lib/urls';
+
+interface Props {
+	id: string;
+	/** Optional heading anchor on the target page, without '#'. */
+	hash?: string;
+}
+
+const stage = STAGE_BY_ID[Astro.props.id];
+if (!stage) throw new Error(`[StageLink] 未知阶段：${Astro.props.id}`);
+const href = pageUrl(stage.slug) + (Astro.props.hash ? `#${Astro.props.hash}` : '');
+const hasSlot = Astro.slots.has('default');
+---
+<a href={href}>{hasSlot ? <slot /> : `阶段 ${stage.n} · ${stage.title}`}</a>

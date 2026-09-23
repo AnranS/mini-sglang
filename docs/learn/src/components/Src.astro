@@ -1,0 +1,18 @@
+---
+// Inline link to a place in the source tree, e.g.
+//   <Src path="scheduler/scheduler.py" sym="Scheduler.overlap_loop" />
+//   <Src path="engine/engine.py" text="torch.manual_seed(42)" />
+//   <Src path="/benchmark/offline/bench.py" />
+import { describeRef } from '../lib/source.mjs';
+
+interface Props {
+	path: string;
+	sym?: string;
+	text?: string;
+	/** Link text. Defaults to the symbol, or the file path. */
+	label?: string;
+}
+
+const ref = describeRef(Astro.props);
+---
+<a class="src-ref" href={ref.url} title={ref.title} target="_blank" rel="noopener"><code>{ref.label}</code>{ref.loc && <span class="src-ref-loc">{ref.loc}</span>}</a>

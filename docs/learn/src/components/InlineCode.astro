@@ -1,0 +1,11 @@
+---
+// Plain text with `code` spans, for strings that come from data files.
+import { splitInlineCode } from '../lib/source.mjs';
+
+interface Props {
+	text: string;
+}
+
+const parts = splitInlineCode(Astro.props.text);
+---
+{parts.map((p: { text: string; code: boolean }) => (p.code ? <code>{p.text}</code> : p.text))}

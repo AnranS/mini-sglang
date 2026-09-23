@@ -1,0 +1,285 @@
+---
+title: 毕业项目
+description: 6 个动手改代码的项目：修 overlap 模式下结束请求的两个问题、修前端状态泄漏、优先级调度、加新模型、混合批调度和显存不够时撤回请求。
+sidebar:
+  order: 3
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import Src from '~/components/Src.astro';
+import StageLink from '~/components/StageLink.astro';
+
+读完各阶段之后，最好的检验是改一次代码并证明改对了。下面 6 个项目都来自 mini-sglang 当前代码里真实存在的问题或缺失的功能。每个项目写了目标、为什么值得做、从哪里入手、怎么验收，以及难度和预计用时。用时按读完相关阶段、对代码已经比较熟来估计，只是参考。
+
+| 项目 | 难度 | 预计用时 | 主要相关的阶段 |
+| --- | --- | --- | --- |
+| 1. 修掉 overlap 模式下结束请求的两个问题 | 中等 | 1–2 天 | <StageLink id="s5" />、<StageLink id="s8" /> |
+| 2. 修前端的请求状态泄漏 | 入门 | 半天 | <StageLink id="s8" /> |
+| 3. 按优先级调度 | 入门到中等 | 1 天 | <StageLink id="s5" />、<StageLink id="s8" /> |
+| 4. 加一个新模型 | 中等 | 2–3 天 | <StageLink id="s3" />、<StageLink id="s9" /> |
+| 5. decode 优先与混合批 | 较难 | 1–5 天 | <StageLink id="s5" />、<StageLink id="s7" /> |
+| 6. 显存不够时撤回请求 | 较难 | 3–5 天 | <StageLink id="s4" />、<StageLink id="s5" />、<StageLink id="s6" /> |
+
+## 开始之前：先量基线
+
+验收时要和改之前比，所以动手前先在自己的机器上把基线量好、记下来：
+
+- **离线吞吐**：`python benchmark/offline/bench.py`（<Src path="/benchmark/offline/bench.py" />），256 个请求、`ignore_eos=True`。在 RTX 4080 SUPER 上默认设置是 4,285 token/s，每组只跑了一次，重复运行会有几个百分点的波动（[实测记录](../measurements/)）。换一张卡数字会不同，以自己量的为准，最好跑三次取中间值。
+- **在线延迟**：先用 `python -m minisgl --model Qwen/Qwen3-0.6B` 起服务，再跑 <Src path="/benchmark/online/bench_simple.py" />。它最后打印 TTFT（首 token 延迟）、TPOT（相邻两个 token 的间隔）和端到端时间的平均值、p50、p90、p99 和最大值。
+- **overlap 探针**：<StageLink id="s5" /> 动手实验第 3 步的 `probe_eos.py`，开 overlap 和关 overlap 各跑一次。
+
+每个项目开一个分支。改调度器的项目，先在 `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` 下调通，再处理 overlap 模式，后者多出来的那一拍是大多数隐蔽问题的来源。
+
+## 1. 修掉 overlap 模式下结束请求的两个问题
+
+**目标**：overlap 模式下，请求结束时的行为和关掉 overlap 时完全一致：
+
+1. 回复不多也不少。以 EOS 结束的请求，不再把 EOS 之后采样出的那个 token 当作正常输出发出去；以 `max_tokens` 结束的请求，只有最后一个 token 带 `finished=True`，服务模式下能拿回完整的 `max_tokens` 个 token。
+2. 迟到的 `token_pool` 写入，不会落进新请求刚拿到的表行里。
+
+**为什么值得做**：默认配置下，服务模式里以 `max_tokens` 结束的回复通常会少最后一个 token，`max_tokens=8` 只拿回 7 个。只有 `max_tokens=1`，或者最后两步之间正好插进了一个 prefill 批时才不少。第 2 点会悄悄改写别的请求的 prompt，<StageLink id="s5" hash="结束的请求还留下了两个问题" /> 里的实验能稳定复现：在 RTX 4080 SUPER 上，第二个请求 prompt 里位置 27 的「电影」被改成了换行符，译文里的 movie 随之消失；第一个请求改成按长度结束，同样会发生。第 1 点在服务模式下还会让反分词进程的 `DecodeStatus` 泄漏（<StageLink id="s8" />）。修这个问题，要把 CPU 领先 GPU 一拍、两个 CUDA stream 之间谁等谁这两件事彻底想清楚。
+
+**从哪里入手**：
+
+- <Src path="scheduler/scheduler.py" sym="Scheduler._process_last_data" />：`finished` 在这里按 `can_decode` 算，`finished_reqs` 的判断也在这里，它只挡住了重复释放，没挡住回复。
+- <Src path="core.py" sym="Req.complete_one" /> 和 <Src path="core.py" sym="Req.append_host" />：长度在发射时推进，token 在收尾时追加，两者差一拍。
+- <Src path="scheduler/scheduler.py" sym="Scheduler._free_req_resources" /> 和 <Src path="scheduler/table.py" sym="TableManager" />：表行在哪里还回去、`allocate` 为什么后进先出。
+- <Src path="scheduler/scheduler.py" sym="Scheduler._forward" /> 里写 `token_pool` 的那一行，以及 <Src path="engine/engine.py" sym="Engine.forward_batch" /> 末尾记录 `copy_done_event` 的位置：写入排在事件**之后**。
+- <Src path="scheduler/prefill.py" sym="PrefillAdder._try_allocate_one" /> 和 <Src path="scheduler/prefill.py" sym="PrefillAdder._add_one_req" />：新请求的 token 在调度器 stream 上非阻塞地拷进 `token_pool`，前者拷命中前缀的那段，后者拷剩下的 prompt。
+
+**思路**（<StageLink id="s5" /> 动手实验第 5 步给过提示，这里补完整）：
+
+- **结束标志早到**：收尾时按 CPU 这一侧的长度判断是否到了 `max_tokens`，也就是 `append_host` 之后看 `len(req.input_ids) >= req.max_device_len`，不再看已经被下一批推进过的 `can_decode`。这样倒数第二个 token 不再带结束标志，请求要等最后一批收尾时才释放。这时请求早已被 `filter_reqs` 移出 decode 集合，但 `DecodeManager.remove_req` 用的是 `discard`，再移一次也不会出错。
+- **多出来的回复**：在 `_process_last_data` 里，遇到已经在 `self.finished_reqs` 里的请求就直接跳过，不调 `append_host`，也不生成 `DetokenizeMsg`。改完上一条之后这样做才安全：`finished_reqs` 里的请求在上一轮收尾时就结束了，而这一批是在那之前发射的，它出现在这一批里只可能是 EOS 之后多算的那一步。如果不先改上一条，以 `max_tokens` 结束的请求在收尾最后一批时也已经在 `finished_reqs` 里，真正的最后一个 token 会被一起跳过。顺序模式下两者永远不相交，行为不变。
+- **迟到的写入**：要保证迟到的写入在表行被下一个请求使用之前执行完。有几种做法，各有代价：
+  - **晚一轮还表行**。以 EOS 结束的请求，结束时先释放 KV、记下表行，到下一轮收尾时统一 `table_manager.free`。要按轮来还，不要等在批里再遇到这个请求时才还：下一批如果是 prefill 批，里面根本没有它，这一行就永远还不回去了。光靠 `copy_done.synchronize()` 不够严格，因为写 `token_pool` 排在 `copy_done` 之后；要在 `_forward` 里写完之后再记一个事件，还表行之前等这个事件。以 `max_tokens` 结束的请求，改完第一条之后已经是在最后一批收尾时才释放，不用再推迟，但同样要等写入之后的那个事件。
+  - **让调度器 stream 等引擎 stream**。新请求往表行里拷 token 之前，让调度器 stream `wait_event` 上一批的写入事件。等待要放在 `_try_allocate_one` 拷命中前缀之前，只加在 `_add_one_req` 里不够。改动小，但拷贝会等 GPU 算完正在跑的那一批，可能让下一批的发射晚一点，要用 benchmark 看代价。
+- KV 页不用推迟释放：新请求写 KV 的 kernel 和迟到的那次前向都在引擎 stream 上，按顺序执行，不会互相覆盖。
+- **一个陷阱**：把 `TableManager.allocate` 改成先进先出，只是让刚还回去的行晚一点被复用，撞上的概率变小。只要表行用满（比如 `max_running_req=1`），照样会撞上，它不是修复。
+
+**验收标准**：
+
+1. 跑 `probe_eos.py`，overlap 开和关的三行输出完全一致：A 的输出是 `'1'`，B 的译文和关 overlap 时逐字相同，最后一行打印 `[]`。把 A 的参数换成 `SamplingParams(max_tokens=3, ignore_eos=True)` 再跑一次，最后一行同样是 `[]`，A 的 `token_ids` 和关 overlap 时一样是 `[16, 151645, 198]`。
+2. 在 `probe_eos.py` 末尾追加下面这段，把 B 换成 300 个随机 token 重复 5 次，每次都应该打印空列表。实测记录里的同类实验（300 个随机 token 重复 5 次）在修复前开 overlap 时，每次都是位置 27 被改成 198。
+3. 服务模式下，用 <StageLink id="s5" /> 动手实验第 4 步的 curl 请求，overlap 开和关都在 `data: [DONE]` 之前返回 8 行，最后一段是 ` Rome`。
+4. 服务模式下，在 <Src path="tokenizer/detokenize.py" sym="DetokenizeManager.detokenize" /> 末尾临时打印 `len(self.decode_map)`，发 20 个会以 EOS 结束的请求（`ignore_eos=False`，`max_tokens` 给得足够大），全部结束后它应该回到 0。修复前观察它是否随请求数增长。
+5. 关掉 overlap 重跑第 1、2、3 步，结果不变。
+6. 表行不泄漏：用 `--max-running-requests 4` 起服务，以随机间隔陆续发 100 个会以 EOS 结束的请求，全部都能返回。间隔随机，才会出现 4 行没占满、正好有新请求进来的时候，prefill 批才会插到两个 decode 批之间。只要有一行还不回来，攒够 4 行之后服务就会卡住。
+7. 重跑 `bench.py`，吞吐和基线相比在正常波动范围内。注意这个 benchmark 用了 `ignore_eos=True`，没有请求以 EOS 结束，所以它只能证明没有变慢，不能证明修好了；证明修好了靠前 6 步。
+
+```python title="probe_eos.py（追加）"
+import random
+
+random.seed(0)
+for trial in range(5):
+    b = [random.randint(1000, 20000) for _ in range(300)]
+    llm.generate([a, b], [SamplingParams(max_tokens=32), SamplingParams(max_tokens=8)])
+    row = llm.token_pool[0, : len(b)].tolist()
+    print(trial, [(i, b[i], row[i]) for i in range(len(b)) if row[i] != b[i]])
+```
+
+这段要放在 `llm.shutdown()` 之前。`max_running_req=1` 时只有第 0 行，B 一定复用 A 用过的那一行。
+
+**进阶**：取消请求的路径有同样的毛病。<Src path="scheduler/scheduler.py" sym="Scheduler._process_one_msg" /> 收到 `AbortBackendMsg` 时立刻还表行，而这个请求可能还在正在飞的那一批里：它迟到的写入同样可能落进新请求的表行；它如果恰好在这一步结束，还会被释放两次。上游 PR #111 用「推迟释放被取消的请求」处理了后一种情况。把你的修法推广到这条路径，并和 PR #111 对比。
+
+## 2. 修前端的请求状态泄漏
+
+**目标**：每个请求结束后（正常结束，或者客户端断开），API server 的 `ack_map` 和 `event_map` 里不再留下它的条目；之后再有这个 uid 的消息到达，也不会被重新放进去。
+
+**为什么值得做**：现在每个正常结束的请求都会在这两张表里各留下一个条目：`ack_map` 里一个列表（默认开着 overlap 时，通常还装着一条迟到的回复，见 <StageLink id="s8" />），`event_map` 里一个 `asyncio.Event`。服务跑得越久留得越多。原因是 async generator 的一个细节：清理用的 `del` 写在 <Src path="server/api_server.py" sym="FrontendManager.wait_for_ack" /> 的最后一个 `yield` 之后，而 `stream_generate`、`stream_chat_completions` 和非流式的 `v1_completions` 读到 `finished` 的那条回复就 `break`，生成器停在 `yield` 上再也不会被推进；之后即使被垃圾回收关闭，抛进去的 `GeneratorExit` 也会跳过那两行。这个项目不用跑模型，适合用来练习给异步代码写测试。
+
+**从哪里入手**：
+
+- <Src path="server/api_server.py" sym="FrontendManager.wait_for_ack" />、<Src path="server/api_server.py" sym="FrontendManager.stream_generate" />、<Src path="server/api_server.py" sym="FrontendManager.stream_chat_completions" />，以及 <Src path="server/api_server.py" sym="v1_completions" /> 里非流式的那个循环。
+- <Src path="server/api_server.py" sym="FrontendManager.listen" />：uid 不在 `ack_map` 里的回复会被丢弃，所以清理及时的话，项目 1 里多出来的那条消息也会被自然丢掉。
+- <Src path="server/api_server.py" sym="FrontendManager.abort_user" />：客户端断开时的清理，修完后它和正常结束的清理不能互相踩（重复 `del` 会抛 `KeyError`）。
+
+**思路**：在交出 `finished` 的那条回复**之前**就把两张表清掉，再 `yield` 它，然后 `return`。靠 `try/finally` 也能写，但 async generator 的 `finally` 要等生成器被关闭才执行，而关闭发生在什么时候由事件循环和垃圾回收决定，不如显式清理可靠。
+
+顺手看一眼 <Src path="server/api_server.py" sym="shell_completion" />：它的 `BackgroundTask(lambda: _abort)` 只是返回了 `_abort` 这个函数，没有调用它；而且 shell 直接读 `body_iterator`，这个后台任务根本不会被执行。shell 模式下目前没有取消的路径。
+
+**验收标准**：写一个不需要 GPU、也不需要起服务的 pytest，用 `asyncio.Queue` 代替 ZeroMQ 队列，放在 `tests/misc/` 下。下面是流式 `/generate` 路径的骨架，是照着上游 [PR #151](https://github.com/sgl-project/mini-sglang/pull/151) 的测试思路写的，没有在本站的环境里运行过：
+
+```python title="tests/misc/test_frontend_state.py"
+import asyncio
+
+import torch
+from minisgl.distributed import DistributedInfo
+from minisgl.message import BatchFrontendMsg, UserReply
+from minisgl.server import api_server
+from minisgl.server.args import ServerArgs
+
+
+def test_stream_generate_releases_state():
+    async def run():
+        state = api_server.FrontendManager(
+            config=ServerArgs(model_path="dummy", tp_info=DistributedInfo(0, 1), dtype=torch.float32),
+            send_tokenizer=asyncio.Queue(),
+            recv_tokenizer=asyncio.Queue(),
+            initialized=True,  # 不让 send_one 自动起 listen，下面手动起
+        )
+        listener = asyncio.create_task(state.listen())
+        live = state.new_user()  # 一个还没结束的请求，它的状态必须保留
+        uid = state.new_user()
+        await state.recv_tokenizer.put(
+            BatchFrontendMsg([UserReply(uid, "Hello", False), UserReply(uid, " world", True)])
+        )
+        chunks = [c async for c in state.stream_generate(uid)]
+        assert chunks[-1] == b"data: [DONE]\n"
+        await state.recv_tokenizer.put(UserReply(uid, "\n", False))  # 迟到的消息
+        await asyncio.sleep(0.01)
+        assert set(state.ack_map) == {live}
+        assert set(state.event_map) == {live}
+        listener.cancel()
+
+    asyncio.run(run())
+```
+
+1. 修复前这个测试失败，修复后通过。
+2. 同样的写法覆盖流式的 `stream_chat_completions` 和非流式的 `v1_completions`（调用前把 `api_server._GLOBAL_STATE` 设成这个 `state`），三条路径都通过。
+3. 再加一个断开连接的用例：消费到一半时调 `abort_user`，之后两张表里也没有这个 uid，并且没有抛异常。
+4. 起一次真实的服务，用 `bench_simple.py` 跑完一轮，确认输出和延迟与基线一致。
+
+做完之后和 PR #151 的改法对比，看看有没有你没想到的路径。
+
+## 3. 按优先级调度
+
+**目标**：请求可以带一个整数优先级，等待队列按优先级接纳；优先级相同的请求保持先来先服务；所有请求都用默认优先级时，行为和现在完全一样。
+
+**为什么值得做**：真实的服务里，交互式请求和离线批处理请求往往混在一起。这个项目改动不大，却要从 HTTP 接口一路改到调度器，把一个字段穿过分词进程和 ZeroMQ 消息；还要想清楚「放不下就停」和优先级放在一起时会发生什么。
+
+**从哪里入手**：
+
+- 接口：<Src path="server/api_server.py" sym="GenerateRequest" /> 和 <Src path="server/api_server.py" sym="OpenAICompletionRequest" /> 加字段，在构造 `SamplingParams` 的地方传下去。
+- 载体：最省事的是给 <Src path="core.py" sym="SamplingParams" /> 加一个 `priority` 字段。消息序列化（<Src path="message/utils.py" sym="serialize_type" />）遍历对象的 `__dict__`，新字段会自动跟着走。它其实不是采样参数，想更干净的话可以加在 `TokenizeMsg`、`UserMsg` 和 `PendingReq` 上，代价是多改几处。
+- 调度：<Src path="scheduler/prefill.py" sym="PrefillManager.add_one_req" /> 和 <Src path="scheduler/prefill.py" sym="PrefillManager.schedule_next_batch" />。
+
+**要想清楚的几件事**：
+
+- **分块中的请求必须留在最前面**。它们已经占着表行、锁着缓存句柄，`schedule_next_batch` 把它们放回队首不是偶然的。排序只能作用在还没被接纳的请求上。
+- **遇到放不下的就 `break`**。有了优先级之后，一个放不下的高优先级大请求会挡住后面所有低优先级的小请求。这是你想要的（保证大请求不被饿死），还是要允许小请求越过去？选一种并说明理由。
+- **饿死**：高优先级请求源源不断时，低优先级请求永远排不上。可以加一个随等待时间提升优先级的规则（aging）。
+- **没有抢占**：优先级只影响接纳顺序，已经在跑的请求不受影响。要让高优先级请求把正在跑的挤出去，需要项目 6 的撤回。
+
+**验收标准**：下面的脚本假设你给 `SamplingParams` 加了 `priority`，数字越小越优先。它只留 2 个表行，8 个请求在第一轮就全部进入等待队列，然后记录每个 uid 第一次出现在回复里的顺序：
+
+```python title="probe_priority.py"
+from minisgl.core import SamplingParams
+from minisgl.llm import LLM
+
+
+class OrderLLM(LLM):
+    def offline_send_result(self, reply):
+        for msg in reply:
+            if msg.uid not in self.first_seen:
+                self.first_seen.append(msg.uid)
+        super().offline_send_result(reply)
+
+
+llm = OrderLLM(
+    "Qwen/Qwen3-0.6B",
+    attention_backend="fi",
+    max_running_req=2,
+    max_seq_len_override=4096,
+    cuda_graph_max_bs=2,
+    memory_ratio=0.5,
+)
+llm.first_seen = []
+prompts = [list(range(1000 + 10 * i, 1010 + 10 * i)) for i in range(8)]
+params = [SamplingParams(max_tokens=8, ignore_eos=True, priority=1 if i < 4 else 0) for i in range(8)]
+llm.generate(prompts, params)
+print(llm.first_seen)
+llm.shutdown()
+```
+
+1. 改之前（去掉 `priority` 参数）打印 `[0, 1, 2, ..., 7]`；改之后 uid 4 到 7 排在 0 到 3 前面，两组内部各自保持 uid 的顺序。
+2. 所有请求都用默认优先级时，用 <StageLink id="s1" /> 的最小脚本做贪心生成，输出和改之前逐字相同。
+3. 服务模式下用 `curl` 带着 `priority` 字段发请求，确认字段能穿过分词进程到达调度器（在 `_process_one_msg` 里打一行日志）。
+4. 如果加了 aging：构造一个低优先级请求和持续到达的高优先级请求，证明低优先级请求在有限的轮数内被接纳。
+
+## 4. 加一个新模型
+
+**目标**：让 mini-sglang 支持一个现在不支持的模型架构。单卡贪心生成的结果和 Hugging Face transformers 对得上；有两张卡的话，张量并行下也对得上。
+
+**为什么值得做**：这是把 <StageLink id="s3" /> 从头到尾再走一遍：模型怎么在 meta device 上建出来、权重名怎么对上、q/k/v 和 gate/up 怎么合并、每一层的前向和 HF 的实现差在哪里。做张量并行的部分，还要用上 <StageLink id="s9" /> 讲的切分规则。
+
+**从哪里入手**：
+
+- <Src path="models/register.py" sym="_MODEL_REGISTRY" />：架构名到类的映射，`config.json` 里的 `architectures[0]` 就是在这里查的。
+- <Src path="models/qwen3.py" />：一个完整的模型只有 83 行，照着它写。公共的注意力块和 MLP 在 <Src path="models/utils.py" sym="RopeAttn" /> 和 <Src path="models/utils.py" sym="GatedMLP" />。
+- <Src path="models/config.py" sym="ModelConfig.from_hf" />：从 HF 配置里取哪些字段，新模型的特殊字段要在这里加。
+- <Src path="models/weight.py" sym="load_weight" />：权重的切分（`_shard_tensor`）、合并（`_MERGE_GROUPS`）和改名。
+
+**选哪个模型**：挑一个还不在注册表里、结构接近 Llama 的小型稠密模型，这样大部分层可以复用，差别集中在几处。例如第一代 Gemma（`GemmaForCausalLM`）：据 transformers 的实现，它的 RMSNorm 乘的是 1 + weight 而不是 weight，embedding 的输出要乘以 hidden size 的平方根，MLP 的激活函数也和 Llama 不同。这几点在动手前要对照 transformers 里 Gemma 的 modeling 文件逐条确认，本站没有核对过；另外 Gemma 的权重在 Hugging Face 上需要先同意许可才能下载。几个会碰到的具体问题：
+
+- `GatedMLP` 的 `FN_MAP` 只认 `silu` 和 `gelu` 两个名字，其他写法会直接报错。
+- 「乘 1 + weight」的 norm 可以在加载权重时给 weight 加 1，继续用现有的融合 kernel，不用写新的 norm。
+- 新增的缩放、偏置这类操作注意放在哪个 dtype 下算，和 HF 保持一致，否则 bfloat16 下会有可见的误差。
+
+**验收标准**：
+
+1. 选 5 个 prompt，分别用 HF 的 `generate(do_sample=False, max_new_tokens=32)` 和 mini-sglang 的 `LLM`（`temperature=0`、`cache_type="naive"`，避开前缀缓存带来的数值差异）生成，比较 token 序列。bfloat16 下偶尔在后面某一步分叉是正常的（[实测记录](../measurements/)里有前缀缓存让输出改变的例子），但分叉之前必须完全相同；第一个 token 就不同，说明有 bug。两边的模型不要放在同一个进程里，先把 HF 的结果存成文件再比，省显存。
+2. 对不上时，用 <StageLink id="s3" /> 里逐层对照 HF 的方法，找到第一个输出不一致的层。
+3. `python -m minisgl --model <新模型> --shell` 能正常对话。
+4. 有两张卡时，`--tp-size 2` 下重复第 1 步，结果和单卡一致。先检查 query head 数、KV head 数和中间层维度能不能被 2 整除。本站没有多卡环境，这一步没有验证过。
+
+## 5. decode 优先与混合批
+
+**目标**：在 <Src path="scheduler/scheduler.py" sym="Scheduler._schedule_next_batch" /> 里实现至少一种和「prefill 优先、整批同类型」不同的策略，并用在线 benchmark 量化它对 TTFT 和 TPOT 的影响。分两级：
+
+- **第一级：换顺序**。比如 decode 优先，但等待中的 prompt token 数超过某个阈值、或者已经连续跑了 k 轮 decode 时，插一次 prefill。只改选批的顺序，不改 `Batch` 的结构。
+- **第二级：混合批**。把正在 decode 的请求（每个只算 1 个 token）并进 prefill 批里一起算，`token_budget` 先扣掉它们的份额，剩下的给新 prompt。
+
+**为什么值得做**：<StageLink id="s5" /> 讲过 prefill 优先的代价：一个长 prompt 进来，所有 decode 请求都要等这一批 prefill 算完，出 token 的间隔突然变长，在线 benchmark 里体现为 TPOT 的尾部（p99、最大值）。代码里的 TODO 也写着以后要支持别的策略。混合批是把 chunked prefill 和 decode 拼在一起的思路，完整版 SGLang 也提供了类似的选项。
+
+**从哪里入手**：
+
+- 选批：`_schedule_next_batch`、<Src path="scheduler/prefill.py" sym="PrefillManager.schedule_next_batch" />、<Src path="scheduler/decode.py" sym="DecodeManager.schedule_next_batch" />。
+- 第二级还要看这些地方怎么对待 `batch.phase`：
+  - <Src path="scheduler/scheduler.py" sym="Scheduler._process_last_data" /> 对 prefill 批里没结束的请求都会调 `cache_req(finished=False)`。混合批里的 decode 请求如果也走这条路，每一步都会往前缀缓存插一次，结果没错，但白白多花 CPU 时间。要按请求区分，而不是按批区分。
+  - <Src path="engine/graph.py" sym="GraphRunner.can_use_cuda_graph" /> 只让 decode 批用 CUDA graph，混合批里的 decode 请求会失去 graph 的收益。
+  - attention 后端的 `prepare_metadata`：prefill 路径本来就要处理任意的 `[cached_len, device_len)`（分块 prefill 就是这样），decode 请求只是长度为 1 的一段，按理可以直接复用。这一点是推测，要自己验证。用 `"fa,fi"` 时，混合批会交给 prefill 那个后端。
+  - <Src path="layers/embedding.py" sym="ParallelLMHead.forward" /> 在 prefill 批里只取每个请求最后一个位置的 hidden state，长度为 1 的请求取到的正好是它自己。
+
+**验收标准**：
+
+1. **没有算错**：用 `ignore_eos=True` 的请求跑一遍，每个请求返回的 token 数都等于它的 `max_tokens`。服务模式下空闲时的 `check_integrity` 不报错（注意它不检查 radix 树内部，见 <StageLink id="s6" />）。
+2. **输出基本一致**：batch 的组成变了，计算的形状随之改变，bfloat16 下贪心输出不一定和改之前逐字相同，这一点不能作为验收条件。改用一组答案确定的 prompt（比如算术题），确认答案仍然正确。
+3. **量化效果**：起服务，改前改后各跑三次 `bench_simple.py`，对比 TTFT 和 TPOT 的 p50、p90、p99 和最大值，写下结论：哪个指标变好了、哪个变差了、为什么。不要只报平均值。
+4. **没有明显变慢**：离线的 `bench.py` 吞吐和基线相比在正常波动范围内；如果下降了，说明是哪一部分开销造成的。
+
+## 6. 显存不够时撤回请求
+
+**目标**：准入时不再按 `max_tokens` 全额预留 KV。decode 时空间不够，就挑一部分正在跑的请求撤回（retract）等待队列，释放它们的表行和 KV；它们之后重新 prefill，从断开的地方接着生成，uid 不变，客户端看不出区别。
+
+**为什么值得做**：现在的准入控制按每个请求**最多**会生成多少 token 预留空间。按 <StageLink id="s5" /> 的准入公式算：在 RTX 4080 SUPER 上实测 KV 池有 112,081 个 token，prompt 1,000、`max_tokens=1024` 时最多同时接纳 55 个请求，哪怕它们实际只生成几十个 token 就结束了。撤回让准入可以乐观一些，这是完整版 SGLang 的做法。
+
+**从哪里入手**：
+
+- <Src path="scheduler/prefill.py" sym="PrefillAdder._try_allocate_one" />：`estimated_len` 那一行上面就是「TODO: better estimate policy」。
+- <Src path="scheduler/decode.py" sym="DecodeManager.inflight_tokens" />：`reserved_size` 的初值，改了估算方式，这里要跟着改。
+- <Src path="scheduler/cache.py" sym="CacheManager._allocate" />：空间真的不够时会在这里的断言失败。撤回要在 `_prepare_batch` 调 `allocate_paged` **之前**完成，也就是在 `_schedule_next_batch` 里先算这一批需要多少页。
+- 撤回一个请求要做的事：从 decode 集合里删掉，调 `_free_req_resources`（radix 缓存下，`cache_req` 会把它已经算好的前缀插进树里，重新 prefill 时大概率能直接命中），再构造一个 <Src path="scheduler/utils.py" sym="PendingReq" /> 放回等待队列的前面：`input_ids` 是 prompt 加上已经生成的 token，`max_tokens` 减去已经生成的数量。
+
+**要注意的坑**：
+
+- **不要改共享的 `SamplingParams`**。<Src path="llm/llm.py" sym="LLM.generate" /> 只给一个 `SamplingParams` 时，所有请求共用同一个对象；直接改它的 `max_tokens` 会影响别的请求。撤回时复制一份。
+- **先在顺序模式下做**。顺序模式下，调度时每个 decode 请求 CPU 上的 `input_ids` 长度正好等于 `device_len`，`cached_len` 比它小 1，撤回后重新 prefill 的长度关系很清楚。overlap 模式下 `append_host` 晚一轮，CPU 上的 `input_ids` 会少最新的那个 token；被撤回的请求如果还在正在飞的那一批里，还会遇到项目 1 和取消请求一样的问题。
+- **挑谁撤回**：最晚进来的、已经生成最少的，还是占 KV 最多的？不同的选择对吞吐和公平性影响不同，写下你的理由。
+- **KV 池至少要放得下一个请求的全部长度**，否则撤回到只剩一个请求也跑不完，要能检测出来并报错，而不是无限循环。
+
+**验收标准**：用 `num_page_override` 造一个很小的 KV 池，逼出撤回：
+
+- 配置：`LLM("Qwen/Qwen3-0.6B", attention_backend="fi", num_page_override=4096, max_seq_len_override=4096)`，`page_size` 保持 1，KV 池就是 4,096 个 token。
+- 负载：32 个请求，每个 prompt 是 200 个随机 token，`SamplingParams(max_tokens=512, ignore_eos=True)`，每个请求单独建一个对象。
+- 按现在的规则，每个请求预留 712 个 token，同时最多接纳 4,096 ÷ 712 向下取整 = 5 个（按代码计算）。32 个请求总共要 22,784 个 token 的 KV，远超池子，所以改了之后一定会发生撤回。
+
+1. 所有请求都跑完，每个返回的 token 数正好是 512，中途没有断言失败。
+2. 在 `_schedule_next_batch` 里打印 decode 集合的大小，峰值明显超过 5；再打印每一轮撤回了几个请求，确认撤回确实发生了。
+3. 跑完后读 `llm.cache_manager.prefix_cache.size_info`（[实测记录](../measurements/)里读 `evictable` 用的就是它），`protected_size` 应该是 0，说明没有漏解锁的句柄。再在服务模式下跑同样的负载，空闲时 `check_integrity` 不报错。
+4. 把 KV 池改回默认大小、用 `bench.py` 跑一遍，吞吐和基线相比在正常波动范围内：空间充足时，撤回的逻辑不应该带来开销。
+5. 进阶：在 overlap 模式下也通过第 1 到 3 步。
+
+<Aside type="tip" title="做完之后">
+上游仓库里还开着和前两个项目相关的讨论：[PR #151](https://github.com/sgl-project/mini-sglang/pull/151)（前端状态泄漏）、[PR #111](https://github.com/sgl-project/mini-sglang/pull/111)（取消与结束同时发生时的重复释放）。截至写作时（上游 `9a91cfa`），没有找到对项目 1 那两个问题的报告。你的修法如果比现有的方案更完整，附上验收步骤里的脚本和前后对比，就是一份像样的 PR。
+</Aside>

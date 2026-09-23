@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.astro/
+
+# The repository root ignores *.json; keep this project's manifests.
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/content/i18n/*.json
